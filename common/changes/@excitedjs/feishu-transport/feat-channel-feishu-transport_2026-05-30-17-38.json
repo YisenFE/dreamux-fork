@@ -1,0 +1,10 @@
+{
+  "changes": [
+    {
+      "packageName": "@excitedjs/feishu-transport",
+      "comment": "init",
+      "type": "patch"
+    }
+  ],
+  "packageName": "@excitedjs/feishu-transport"
+}
