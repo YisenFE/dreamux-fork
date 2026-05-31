@@ -2,7 +2,7 @@
 
 Rush + pnpm monorepo since issue #4. Three packages today, all wired
 through pnpm `workspace:*` and installed via the rush path only (see
-[decision 0006](../decisions/0006-install-model.md)):
+[the install-model decision](../decisions/install-model.md)):
 
 | Package | Folder | Role |
 |---|---|---|
@@ -20,7 +20,7 @@ sibling claudemux repo import one implementation instead of drifting copies.
 |---|---|
 | `/rush.json` | Rush project list + pnpm/Node version pins |
 | `/common/config/rush/` | Rush command definitions (`command-line.json`), pnpm `.npmrc`, version policies, generated `pnpm-lock.yaml` |
-| `/common/scripts/install-run-rush.js` | Bootstrap that shells out to `npx @microsoft/rush@<version>` (see [decision 0001](../decisions/0001-rush-pnpm-monorepo.md)) |
+| `/common/scripts/install-run-rush.js` | Bootstrap that shells out to `npx @microsoft/rush@<version>` (see [the Rush + pnpm decision](../decisions/rush-pnpm-monorepo.md)) |
 | `/common/temp/` | Rush working dir (gitignored) |
 | `/packages/dreamux/` | The `@excitedjs/dreamux` package |
 | `/bin/` | Thin shims that forward to `/packages/dreamux/bin/` so pre-monorepo PATH entries keep working |
@@ -61,14 +61,60 @@ The per-package `cd packages/dreamux && npm install` path is **retired**:
 pnpm `workspace:*` protocol, which `npm` cannot resolve. There is no
 committed per-package `package-lock.json`. External consumers are
 unaffected — pnpm rewrites `workspace:*` to a real version at publish time.
-See [decision 0006](../decisions/0006-install-model.md) (which retires the
-two-paths consequence of [decision 0001](../decisions/0001-rush-pnpm-monorepo.md)).
+See [the install-model decision](../decisions/install-model.md) (which retires
+the two-paths consequence of [the Rush + pnpm decision](../decisions/rush-pnpm-monorepo.md)).
+
+## Rush change files
+
+Release-facing changes need Rush change files under
+`/common/changes/<package>/`. Always validate them before pushing:
+
+```bash
+node common/scripts/install-run-rush.js change --verify --no-fetch
+```
+
+Rush can generate change files non-interactively when every changed package
+uses the same release type and message:
+
+```bash
+node common/scripts/install-run-rush.js change \
+  --bulk \
+  --message "Short release note" \
+  --bump-type patch \
+  --target-branch main \
+  --no-fetch \
+  --overwrite
+```
+
+Use `--email "<git author>"` only when Rush cannot infer the author from git.
+Do not paste real email addresses into chat or issue comments; some channels
+treat them as sensitive data.
+
+When changed packages need different release notes, write one JSON file per
+package instead of forcing `--bulk`. The accepted schema is:
+
+```json
+{
+  "changes": [
+    {
+      "comment": "Short release note",
+      "type": "patch",
+      "packageName": "@excitedjs/dreamux"
+    }
+  ],
+  "packageName": "@excitedjs/dreamux",
+  "email": "<git author>"
+}
+```
+
+Then run the same `rush change --verify --no-fetch` command. This keeps
+multi-package release notes precise while still using Rush as the validator.
 
 ## Public surface
 
 - npm package: `@excitedjs/dreamux`
 - CLI binaries installed by the package:
-  - `dreamux` (preferred, see [decision 0002](../decisions/0002-cli-and-package-naming.md))
+  - `dreamux` (preferred, see [the CLI naming decision](../decisions/cli-and-package-naming.md))
   - `dreamux-server` (legacy alias)
   - `server-ctl` (legacy alias)
 
@@ -80,4 +126,4 @@ two-paths consequence of [decision 0001](../decisions/0001-rush-pnpm-monorepo.md
 | `~/.codex-host/` | Server-owned runtime state: SQLite (`state.db`), admin socket, per-dispatcher codex sockets and logs. | The server |
 
 The split is load-bearing: a `rm -rf ~/.codex-host` recovery never loses
-user-edited settings. See [decision 0003](../decisions/0003-global-config-dir.md).
+user-edited settings. See [the global-config decision](../decisions/global-config-dir.md).
