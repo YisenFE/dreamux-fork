@@ -43,9 +43,9 @@ local server in the foreground; service managers invoke that same command.
 - `/packages/dreamux/src/codex/supervisor.ts` currently starts Codex with
   `codex app-server --listen unix://<socket>`.
 
-Issue #18 changes the published CLI shape and adds onboarding / daemon
-management. It should reuse the existing server and dispatcher seams rather
-than create a second runtime.
+Issue #18 changes the published CLI shape and adds onboarding / user-level
+service registration. It should reuse the existing server and dispatcher
+seams rather than create a second runtime.
 
 ## Command surface
 
@@ -56,11 +56,6 @@ dreamux onboard
 dreamux serve
 dreamux status
 dreamux doctor
-dreamux daemon install
-dreamux daemon uninstall
-dreamux daemon start
-dreamux daemon stop
-dreamux daemon status
 dreamux dispatcher add
 dreamux dispatcher remove
 dreamux dispatcher list
@@ -79,9 +74,6 @@ Introspection command scope:
 - `dreamux doctor`: diagnostic preflight for installation health, tool
   versions, config parse errors, service registration, plugin presence,
   runtime dir permissions, and Codex app-server capability.
-- `dreamux daemon status`: native service-manager view only: installed,
-  enabled, loaded, running, pid when available, and recent service-manager
-  failure reason.
 - `dreamux dispatcher status --id <id>`: one dispatcher's admin-state view:
   bot/channel identity, enabled flag, runtime status, thread id, last error,
   and inbound/outbound backlog.
@@ -200,10 +192,10 @@ Open default inputs:
 
 | Value | Default direction |
 |---|---|
-| Codex marketplace source | Public dreamux / codexmux marketplace source |
-| Codex plugin selector | `codexmux` from that marketplace |
-| Claude marketplace source | Public claudemux marketplace source |
-| Claude plugin selector | `claudemux` from that marketplace |
+| Codex marketplace source | Public `excitedjs/dreamux` with sparse path `codex-marketplace` |
+| Codex plugin selector | `codexmux@dreamux` |
+| Claude marketplace source | Public `excitedjs/claudemux` |
+| Claude plugin selector | `claudemux@claudemux` |
 | Claude install scope | `user` |
 
 Do not commit concrete private identifiers, local user paths, internal
@@ -365,11 +357,19 @@ Use argv arrays and native unit files, not shell strings.
 The first implementation only supports user-level services. It must not
 install root-scoped macOS LaunchDaemons or root-scoped systemd services.
 
-`dreamux onboard` should delegate service creation to the same code path as
-`dreamux daemon install`, passing the values collected by the wizard. Re-run
-semantics must be idempotent: if the generated service file already matches
-the desired content, report it as `unchanged`; if the desired content differs,
-report `modified` and reload/restart through the native service manager.
+`dreamux onboard` owns first-time service creation directly. Re-run semantics
+must be idempotent: if the generated service file already matches the desired
+content, report it as `unchanged`; if the desired content differs, report
+`modified` and reload/restart through the native service manager.
+
+There is no public `dreamux daemon ...` command tree in issue #18. A user-level
+service that runs foreground `dreamux serve` is the daemon shape. After
+onboarding, operators use the native service manager directly for ongoing
+start / stop / status / uninstall operations.
+
+The package launcher resolves its own symlink chain and passes the resolved
+absolute launcher path to the TypeScript CLI via `DREAMUX_BIN`; service unit
+generation uses that value unless the operator supplies `--dreamux-bin`.
 
 ### macOS launchd
 
@@ -439,8 +439,7 @@ Alternatives:
   `CODEX_HOME`, not the operator's default global Codex home.
 - Service registration is user-level only: macOS LaunchAgent and
   `systemd --user`.
-
-## Remaining open implementation details
-
-- The final public marketplace sources / selectors for `codexmux` and
-  `claudemux`.
+- Marketplace defaults for the first implementation are
+  `excitedjs/dreamux --sparse codex-marketplace` plus
+  `codexmux@dreamux` for Codex, and `excitedjs/claudemux` plus
+  `claudemux@claudemux` for Claude.

@@ -15,13 +15,19 @@ import yargs, { type Argv } from 'yargs';
 import { hideBin } from 'yargs/helpers';
 
 import { globalConfigFile } from '../runtime/config.js';
+import { runOnboard } from '../onboard/run.js';
+import {
+  collectOnboardAnswers,
+  type OnboardCliOptions,
+} from '../onboard/wizard.js';
+import type { OnboardRunResult } from '../onboard/types.js';
+import { printDoctorResult, runDreamuxDoctor } from './doctor.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SERVER_ENTRY = join(HERE, 'server.js');
 const SERVER_CTL_ENTRY = join(HERE, 'server-ctl.js');
 
 type DispatcherVerb = 'remove' | 'status' | 'start' | 'stop';
-type DaemonVerb = 'install' | 'uninstall' | 'start' | 'stop' | 'status';
 
 async function execEntry(
   entry: string,
@@ -47,10 +53,6 @@ async function execEntry(
 
 function adminEnv(): NodeJS.ProcessEnv {
   return { ...process.env, DREAMUX_ADMIN_CLI_NAME: 'dreamux' };
-}
-
-function notImplemented(command: string): never {
-  throw new Error(`${command} is not implemented in this serve-foundation build`);
 }
 
 function requiredString(value: unknown, name: string): string {
@@ -144,16 +146,129 @@ function buildDispatcherCommands(y: Argv): Argv {
     .strict();
 }
 
-function buildDaemonCommands(y: Argv): Argv {
+function buildOnboardCommand(y: Argv): Argv {
   return y
-    .command(
-      ['install', 'uninstall', 'start', 'stop', 'status'],
-      'Manage the user-level service',
-      (yy) => yy,
-      (argv) => notImplemented(`dreamux daemon ${requiredString(argv._[1], 'daemon verb') as DaemonVerb}`),
-    )
-    .demandCommand(1, 'Choose a daemon command')
-    .strict();
+    .option('yes', {
+      type: 'boolean',
+      describe: 'Accept defaults and require non-default values via options',
+    })
+    .option('dry-run', {
+      type: 'boolean',
+      describe: 'Print the planned file ledger without writing or registering',
+    })
+    .option('config-dir', {
+      type: 'string',
+      describe: 'dreamux global config directory',
+    })
+    .option('runtime-dir', {
+      type: 'string',
+      describe: 'dreamux runtime directory',
+    })
+    .option('dispatcher-id', {
+      type: 'string',
+      describe: 'Dispatcher id to create or update',
+    })
+    .option('codex-bin', {
+      type: 'string',
+      describe: 'Codex CLI binary or absolute path',
+    })
+    .option('codex-model', {
+      type: 'string',
+      describe: 'Model written to dispatcher private CODEX_HOME/config.toml',
+    })
+    .option('codex-provider', {
+      type: 'string',
+      describe: 'Provider label used for onboarding prompts and auth guidance',
+    })
+    .option('auth-env-var', {
+      type: 'string',
+      describe: 'Auth env var passed to dispatcher Codex runtime',
+    })
+    .option('codex-marketplace-source', {
+      type: 'string',
+      describe: 'Codex plugin marketplace source',
+    })
+    .option('codex-marketplace-sparse', {
+      type: 'array',
+      string: true,
+      describe: 'Sparse checkout path for the Codex marketplace source',
+    })
+    .option('codex-marketplace-name', {
+      type: 'string',
+      describe: 'Codex marketplace name',
+    })
+    .option('codex-plugin-ref', {
+      type: 'string',
+      describe: 'Codex plugin ref, e.g. codexmux@dreamux',
+    })
+    .option('claude-bin', {
+      type: 'string',
+      describe: 'Claude CLI binary or absolute path',
+    })
+    .option('claude-config-dir', {
+      type: 'string',
+      describe: 'Claude config directory used for plugin installation',
+    })
+    .option('claude-marketplace-source', {
+      type: 'string',
+      describe: 'Claude plugin marketplace source',
+    })
+    .option('claude-marketplace-sparse', {
+      type: 'array',
+      string: true,
+      describe: 'Sparse checkout path for the Claude marketplace source',
+    })
+    .option('claude-marketplace-name', {
+      type: 'string',
+      describe: 'Claude marketplace name',
+    })
+    .option('claude-plugin-ref', {
+      type: 'string',
+      describe: 'Claude plugin ref, e.g. claudemux@claudemux',
+    })
+    .option('bot-app-id', {
+      type: 'string',
+      describe: 'Channel bot app id',
+    })
+    .option('bot-secret-ref', {
+      type: 'string',
+      describe: 'Secret reference, for example env:BOT_SECRET_NAME',
+    })
+    .option('register-service', {
+      type: 'boolean',
+      describe: 'Write and register the user-level service',
+    })
+    .option('start-service', {
+      type: 'boolean',
+      describe: 'Start the service after registration',
+    })
+    .option('dreamux-bin', {
+      type: 'string',
+      describe: 'Absolute dreamux bin path used by the service unit',
+    });
+}
+
+async function handleOnboard(argv: unknown): Promise<void> {
+  const answers = await collectOnboardAnswers(argv as OnboardCliOptions);
+  const result = await runOnboard({ answers });
+  printOnboardResult(result);
+}
+
+function printOnboardResult(result: OnboardRunResult): void {
+  console.log('dreamux onboard file ledger:');
+  for (const entry of result.files) {
+    console.log(`${entry.status}\t${entry.path}\t${entry.reason}`);
+  }
+  console.log(
+    result.doctor.ok
+      ? 'dreamux onboard doctor: ok'
+      : `dreamux onboard doctor: failed (${result.doctor.errors.length} error(s))`,
+  );
+  if (result.service !== null) {
+    console.log(
+      `dreamux onboard service: ${result.service.platform} ${result.service.unitPath}`,
+    );
+  }
 }
 
 function buildConfigCommands(y: Argv): Argv {
@@ -189,8 +304,8 @@ async function main(): Promise<void> {
     .command(
       'onboard',
       'Run first-time setup',
-      (yy) => yy,
-      () => notImplemented('dreamux onboard'),
+      buildOnboardCommand,
+      handleOnboard,
     )
     .command(
       'serve',
@@ -207,13 +322,20 @@ async function main(): Promise<void> {
     .command(
       'doctor',
       'Run setup diagnostics',
-      (yy) => yy,
-      () => notImplemented('dreamux doctor'),
-    )
-    .command(
-      'daemon <command>',
-      'Manage the user-level service',
-      buildDaemonCommands,
+      (yy) =>
+        yy.option('json', {
+          type: 'boolean',
+          describe: 'Print machine-readable JSON',
+        }),
+      async (argv) => {
+        const result = await runDreamuxDoctor();
+        if (argv.json === true) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          printDoctorResult(result);
+        }
+        if (!result.ok) process.exitCode = 1;
+      },
     )
     .command(
       'dispatcher <command>',
