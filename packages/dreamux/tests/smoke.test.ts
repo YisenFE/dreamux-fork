@@ -12,8 +12,14 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Server } from '../src/server.js';
@@ -21,6 +27,14 @@ import { CodexProcess, type CodexProcessOptions } from '../src/codex/supervisor.
 import { CodexWsClient } from '../src/codex/rpc.js';
 import { createFakeFeishuBot, type FakeFeishuBot, type FeishuInboundEvent } from '../src/feishu/bot.js';
 import { createAdminSocketServer } from '../src/admin/socket.js';
+import { BUILT_IN_DEFAULTS } from '../src/runtime/config.js';
+import {
+  dispatcherAppServerControlDir,
+  dispatcherCodexConfigPath,
+  dispatcherCodexHome,
+  dispatcherCodexPluginsDir,
+  dispatcherSocketPath,
+} from '../src/runtime/paths.js';
 import { startFakeCodex, type FakeCodex } from './fake-codex.js';
 
 class NoopCodexProcess extends CodexProcess {
@@ -41,17 +55,28 @@ function buildServer(opts: {
   bot: FakeFeishuBot;
   /** Optional spawn counter — bumped each time a NoopCodexProcess is built. */
   spawnCounter?: { count: number };
+  capturedCodexOptions?: CodexProcessOptions[];
+  useDefaultCodexHomeDoctor?: boolean;
 }): Server {
   return new Server({
+    config: { ...BUILT_IN_DEFAULTS, runtime_dir: opts.runtimeDir },
     databasePath: join(opts.runtimeDir, 'state.db'),
     adminSocketPath: join(opts.runtimeDir, 'admin.sock'),
     skipBotSecret: true,
     botFactory: () => opts.bot,
     codexProcessFactory: (o) => {
       if (opts.spawnCounter !== undefined) opts.spawnCounter.count++;
+      opts.capturedCodexOptions?.push(o);
       return new NoopCodexProcess(o);
     },
     codexClientFactory: () => new CodexWsClient({ url: opts.fake.url }),
+    ...(opts.useDefaultCodexHomeDoctor === true
+      ? {}
+      : {
+          codexHomeDoctor: () => {
+            /* fake codex tests do not require a real dispatcher CODEX_HOME */
+          },
+        }),
   });
 }
 
@@ -64,7 +89,7 @@ function fakeInbound(
     messageId: msgId,
     chatId,
     chatType: 'group',
-    senderId: 'ou_sender_test',
+    senderId: 'sender-test',
     senderType: 'user',
     messageType: 'text',
     rawContent: JSON.stringify({ text }),
@@ -91,6 +116,35 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function writeReadyDispatcherCodexHome(dispatcherId: string): void {
+  mkdirSync(dispatcherCodexHome(dispatcherId), { recursive: true });
+  writeFileSync(
+    dispatcherCodexConfigPath(dispatcherId),
+    `model = "gpt-test"
+approval_policy = "never"
+
+[marketplaces.dreamux]
+source = "public"
+
+[plugins.codexmux]
+enabled = true
+`,
+    { mode: 0o600 },
+  );
+  writeFileSync(join(dispatcherCodexHome(dispatcherId), 'auth.json'), '{}', {
+    mode: 0o600,
+  });
+  mkdirSync(
+    join(
+      dispatcherCodexPluginsDir(dispatcherId),
+      'cache',
+      'dreamux',
+      'codexmux',
+    ),
+    { recursive: true },
+  );
+}
+
 describe('dreamux MVP smoke', () => {
   let runtimeDir: string;
   let fake: FakeCodex;
@@ -100,7 +154,7 @@ describe('dreamux MVP smoke', () => {
   beforeEach(async () => {
     runtimeDir = mkdtempSync(join(tmpdir(), 'dreamux-'));
     fake = await startFakeCodex();
-    bot = createFakeFeishuBot('cli_smoke');
+    bot = createFakeFeishuBot('app-smoke');
   });
 
   afterEach(async () => {
@@ -117,20 +171,20 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     await server.start();
 
-    await bot.inject(fakeInbound('oc_group_a', 'hi', 'om_1'));
+    await bot.inject(fakeInbound('chat-group-a', 'hi', 'msg-1-id'));
 
     await waitFor(() => bot.sentMessages.length >= 1);
     expect(bot.sentMessages[0]).toMatchObject({
-      chatId: 'oc_group_a',
+      chatId: 'chat-group-a',
       target: {
-        chatId: 'oc_group_a',
-        replyToMessageId: 'om_1',
-        mentionUserIds: ['ou_sender_test'],
+        chatId: 'chat-group-a',
+        replyToMessageId: 'msg-1-id',
+        mentionUserIds: ['sender-test'],
       },
       text: 'echo: hi',
     });
@@ -145,17 +199,66 @@ describe('dreamux MVP smoke', () => {
     expect(d?.status).toBe('ready');
   });
 
+  it('starts the dispatcher app-server under the dispatcher private CODEX_HOME', async () => {
+    const capturedCodexOptions: CodexProcessOptions[] = [];
+    server = buildServer({ runtimeDir, fake, bot, capturedCodexOptions });
+    server.repos.dispatchers.create({
+      dispatcher_id: 'flow',
+      bot_app_id: 'app-smoke',
+      bot_secret_ref: 'env:UNUSED',
+    });
+
+    await server.start();
+
+    expect(capturedCodexOptions).toHaveLength(1);
+    expect(capturedCodexOptions[0]?.env?.['CODEX_HOME']).toBe(
+      dispatcherCodexHome('flow'),
+    );
+    expect(capturedCodexOptions[0]?.socketPath).toBe(
+      dispatcherSocketPath('flow'),
+    );
+  });
+
+  it('runs the default dispatcher CODEX_HOME doctor before spawning the app-server', async () => {
+    rmSync(runtimeDir, { recursive: true, force: true });
+    runtimeDir = mkdtempSync(join(homedir(), '.dreamux-smoke-'));
+    const capturedCodexOptions: CodexProcessOptions[] = [];
+    server = buildServer({
+      runtimeDir,
+      fake,
+      bot,
+      capturedCodexOptions,
+      useDefaultCodexHomeDoctor: true,
+    });
+    server.repos.dispatchers.create({
+      dispatcher_id: 'flow',
+      bot_app_id: 'app-smoke',
+      bot_secret_ref: 'env:UNUSED',
+      codex_args_json: JSON.stringify({ sandboxMode: 'danger-full-access' }),
+    });
+    writeReadyDispatcherCodexHome('flow');
+
+    expect(existsSync(dispatcherAppServerControlDir('flow'))).toBe(false);
+    await server.start();
+
+    expect(capturedCodexOptions).toHaveLength(1);
+    expect(capturedCodexOptions[0]?.env?.['CODEX_HOME']).toBe(
+      dispatcherCodexHome('flow'),
+    );
+    expect(existsSync(dispatcherAppServerControlDir('flow'))).toBe(true);
+  });
+
   it('compatible Feishu gate drops bot-loop messages before durable enqueue', async () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     await server.start();
 
     await bot.inject({
-      ...fakeInbound('oc_group_a', 'loop', 'om_loop'),
+      ...fakeInbound('chat-group-a', 'loop', 'msg-loop'),
       senderId: bot.botOpenId ?? '',
     });
 
@@ -169,14 +272,14 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     await server.start();
 
     await bot.inject({
-      ...fakeInbound('oc_group_a', 'bot says hi', 'om_bot'),
-      senderId: 'ou_peer_bot',
+      ...fakeInbound('chat-group-a', 'bot says hi', 'msg-bot'),
+      senderId: 'peer-bot',
       senderType: 'bot',
     });
 
@@ -194,13 +297,13 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     await server.start();
 
-    await bot.inject(fakeInbound('oc_group_a', 'msg-1', 'om_a'));
-    await bot.inject(fakeInbound('oc_group_a', 'msg-2', 'om_b'));
+    await bot.inject(fakeInbound('chat-group-a', 'msg-1', 'msg-a'));
+    await bot.inject(fakeInbound('chat-group-a', 'msg-2', 'msg-b'));
 
     await waitFor(() => bot.sentMessages.length >= 2, 6000);
     expect(bot.sentMessages.map((m) => m.text)).toEqual([
@@ -213,7 +316,7 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
 
@@ -223,9 +326,9 @@ describe('dreamux MVP smoke', () => {
     void insert;
     const row = server.repos.inbound.enqueue({
       dispatcher_id: 'flow',
-      source_chat_id: 'oc_group_a',
-      source_message_id: 'om_pre_crash',
-      sender_id: 'ou_sender',
+      source_chat_id: 'chat-group-a',
+      source_message_id: 'message-pre-crash',
+      sender_id: 'sender',
       feishu_event_json: '{}',
       parsed_text: 'pretend-this-was-running',
     });
@@ -248,7 +351,7 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     // Pre-seed an existing thread_id so startup will try thread/resume.
@@ -274,7 +377,7 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     await server.start();
@@ -287,7 +390,7 @@ describe('dreamux MVP smoke', () => {
       return origSend(target, text);
     };
 
-    await bot.inject(fakeInbound('oc_group_a', 'retry-me', 'om_r'));
+    await bot.inject(fakeInbound('chat-group-a', 'retry-me', 'msg-retry'));
 
     await waitFor(() => bot.sentMessages.length >= 1);
     expect(attempts).toBeGreaterThanOrEqual(2);
@@ -302,12 +405,12 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     await server.start();
 
-    await bot.inject(fakeInbound('oc_group_a', 'do-something', 'om_app'));
+    await bot.inject(fakeInbound('chat-group-a', 'do-something', 'msg-app'));
 
     // The approval rejection sends a hint message; the turn itself completes
     // (codex still emits turn/completed after the server-request), so the
@@ -327,7 +430,7 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
 
@@ -335,9 +438,9 @@ describe('dreamux MVP smoke', () => {
     // *after* accepting the inbound but *before* the worker dequeued it.
     const row = server.repos.inbound.enqueue({
       dispatcher_id: 'flow',
-      source_chat_id: 'oc_backlog',
-      source_message_id: 'om_backlog_1',
-      sender_id: 'ou_sender',
+      source_chat_id: 'chat-backlog',
+      source_message_id: 'msg-backlog_1',
+      sender_id: 'sender',
       feishu_event_json: '{}',
       parsed_text: 'queued-before-crash',
     });
@@ -360,7 +463,7 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     await server.start();
@@ -412,7 +515,7 @@ describe('dreamux MVP smoke', () => {
     server = buildServer({ runtimeDir, fake, bot, spawnCounter: counter });
     server.repos.dispatchers.create({
       dispatcher_id: 'flow',
-      bot_app_id: 'cli_smoke',
+      bot_app_id: 'app-smoke',
       bot_secret_ref: 'env:UNUSED',
     });
     // Don't call server.start() (which would auto-start); race two explicit
