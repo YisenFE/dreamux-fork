@@ -14,8 +14,15 @@ import { fileURLToPath } from 'node:url';
 import yargs, { type Argv } from 'yargs';
 import { hideBin } from 'yargs/helpers';
 
-import { globalConfigFile } from '../runtime/config.js';
+import {
+  globalConfigFile,
+  redactConfigForDisplay,
+} from '../runtime/config.js';
 import { runOnboard } from '../onboard/run.js';
+import {
+  runUninstall,
+  type UninstallRunResult,
+} from '../onboard/uninstall.js';
 import {
   collectOnboardAnswers,
   type OnboardCliOptions,
@@ -99,7 +106,7 @@ function buildDispatcherCommands(y: Argv): Argv {
           .option('bot-secret-ref', {
             type: 'string',
             demandOption: true,
-            describe: 'Secret reference, for example env:BOT_SECRET_NAME',
+            describe: 'Secret reference, usually config:<dispatcher-id>',
           })
           .option('codex-args-json', {
             type: 'string',
@@ -168,21 +175,13 @@ function buildOnboardCommand(y: Argv): Argv {
       type: 'string',
       describe: 'Dispatcher id to create or update',
     })
+    .option('dispatcher-cwd', {
+      type: 'string',
+      describe: 'Working directory used when starting the dispatcher Codex app-server',
+    })
     .option('codex-bin', {
       type: 'string',
       describe: 'Codex CLI binary or absolute path',
-    })
-    .option('codex-model', {
-      type: 'string',
-      describe: 'Model written to dispatcher private CODEX_HOME/config.toml',
-    })
-    .option('codex-provider', {
-      type: 'string',
-      describe: 'Provider label used for onboarding prompts and auth guidance',
-    })
-    .option('auth-env-var', {
-      type: 'string',
-      describe: 'Auth env var passed to dispatcher Codex runtime',
     })
     .option('codex-marketplace-source', {
       type: 'string',
@@ -230,9 +229,9 @@ function buildOnboardCommand(y: Argv): Argv {
       type: 'string',
       describe: 'Channel bot app id',
     })
-    .option('bot-secret-ref', {
+    .option('bot-app-secret', {
       type: 'string',
-      describe: 'Secret reference, for example env:BOT_SECRET_NAME',
+      describe: 'Channel bot app secret written to dreamux config',
     })
     .option('register-service', {
       type: 'boolean',
@@ -254,6 +253,36 @@ async function handleOnboard(argv: unknown): Promise<void> {
   printOnboardResult(result);
 }
 
+function buildUninstallCommand(y: Argv): Argv {
+  return y
+    .option('dry-run', {
+      type: 'boolean',
+      describe: 'Print the planned removals without deleting or unregistering',
+    })
+    .option('config-dir', {
+      type: 'string',
+      describe: 'dreamux global config directory',
+    })
+    .option('runtime-dir', {
+      type: 'string',
+      describe: 'dreamux runtime directory',
+    });
+}
+
+async function handleUninstall(argv: unknown): Promise<void> {
+  const args = argv as {
+    dryRun?: boolean;
+    configDir?: string;
+    runtimeDir?: string;
+  };
+  const result = await runUninstall({
+    dryRun: args.dryRun,
+    configDir: args.configDir,
+    runtimeDir: args.runtimeDir,
+  });
+  printUninstallResult(result);
+}
+
 function printOnboardResult(result: OnboardRunResult): void {
   console.log('dreamux onboard file ledger:');
   for (const entry of result.files) {
@@ -271,6 +300,16 @@ function printOnboardResult(result: OnboardRunResult): void {
   }
 }
 
+function printUninstallResult(result: UninstallRunResult): void {
+  console.log('dreamux uninstall file ledger:');
+  for (const entry of result.entries) {
+    console.log(`${entry.status}\t${entry.path}\t${entry.reason}`);
+  }
+  console.log(
+    `dreamux uninstall service: ${result.service.platform} ${result.service.unitPath}`,
+  );
+}
+
 function buildConfigCommands(y: Argv): Argv {
   return y
     .command(
@@ -284,13 +323,20 @@ function buildConfigCommands(y: Argv): Argv {
     .command(
       'show',
       'Print the dreamux global config file',
-      (yy) => yy,
-      () => {
+      (yy) =>
+        yy.option('raw', {
+          type: 'boolean',
+          describe: 'Print unredacted config, including channel secrets',
+        }),
+      (argv) => {
         const file = globalConfigFile();
         if (!existsSync(file)) {
           throw new Error(`config file does not exist: ${file}`);
         }
-        process.stdout.write(readFileSync(file, 'utf8'));
+        const raw = readFileSync(file, 'utf8');
+        process.stdout.write(
+          argv.raw === true ? raw : redactConfigForDisplay(raw, file),
+        );
       },
     )
     .demandCommand(1, 'Choose a config command')
@@ -306,6 +352,12 @@ async function main(): Promise<void> {
       'Run first-time setup',
       buildOnboardCommand,
       handleOnboard,
+    )
+    .command(
+      'uninstall',
+      'Remove files and user service created by onboard',
+      buildUninstallCommand,
+      handleUninstall,
     )
     .command(
       'serve',

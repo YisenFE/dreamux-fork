@@ -1,13 +1,17 @@
-import { mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 import { DispatcherRepo } from '../db/repository.js';
 import { openDatabase } from '../db/schema.js';
 import { codexArgsToCli, parseCodexArgs } from '../runtime/codex-args.js';
 import {
+  assertNoLegacyTomlOnly,
+  globalConfigFile,
+  loadConfig,
+  stringifyConfig,
+} from '../runtime/config.js';
+import {
   dispatcherAppServerControlDir,
-  dispatcherCodexConfigPath,
-  dispatcherCodexCwd,
   dispatcherCodexHome,
   dispatcherCodexPluginsDir,
   databasePath,
@@ -20,8 +24,7 @@ import {
 } from '../runtime/dispatcher-codex-home.js';
 import { ExecaCommandRunner } from './commands.js';
 import {
-  buildDispatcherCodexConfigToml,
-  buildDreamuxConfigToml,
+  dispatcherBotSecretRef,
   dispatcherCodexArgsJson,
   dreamuxConfigFromAnswers,
 } from './config-files.js';
@@ -61,31 +64,32 @@ export async function runOnboard(
   const ledger = options.ledger ?? new TransparentFileLedger();
   const runner = options.runner ?? new ExecaCommandRunner();
   const env = options.env ?? process.env;
-  const dreamuxConfig = dreamuxConfigFromAnswers(answers);
+  const configPath = globalConfigFile({ configDir: answers.configDir });
+  const existingConfig = readExistingDreamuxConfig(answers.configDir);
+  const dreamuxConfig = dreamuxConfigFromAnswers(answers, existingConfig);
+  const effectiveAnswers = {
+    ...answers,
+    runtimeDir: dreamuxConfig.runtime_dir,
+    codexBin: dreamuxConfig.codex.bin,
+  };
   setRuntimeConfig(dreamuxConfig);
 
-  if (!answers.registerService) {
-    preflightAuth(answers, env);
-  }
-
-  const configPath = join(answers.configDir, 'config.toml');
   ensureDirectory(answers.configDir, ledger, 'dreamux config directory', {
     dryRun: answers.dryRun,
   });
-  ensureDirectory(answers.runtimeDir, ledger, 'dreamux runtime directory', {
+  ensureDirectory(effectiveAnswers.runtimeDir, ledger, 'dreamux runtime directory', {
     dryRun: answers.dryRun,
   });
   writeTextFile(
     configPath,
-    buildDreamuxConfigToml(answers),
+    stringifyConfig(dreamuxConfig),
     ledger,
     'dreamux global config',
     { mode: 0o600, dryRun: answers.dryRun },
   );
 
   const codexHome = dispatcherCodexHome(answers.dispatcherId);
-  const codexConfigPath = dispatcherCodexConfigPath(answers.dispatcherId);
-  ensureDirectory(codexHome, ledger, 'dispatcher private CODEX_HOME', {
+  ensureDirectory(codexHome, ledger, 'operator Codex home', {
     dryRun: answers.dryRun,
   });
   ensureDirectory(
@@ -101,49 +105,36 @@ export async function runOnboard(
     { dryRun: answers.dryRun },
   );
   ensureDirectory(
-    dispatcherCodexCwd(answers.dispatcherId),
+    effectiveAnswers.dispatcherCwd,
     ledger,
-    'dispatcher app-server cwd',
+    'dispatcher cwd',
     { dryRun: answers.dryRun },
   );
 
   await installCodexmuxPlugin({
-    answers,
+    answers: effectiveAnswers,
     codexHome,
     ledger,
     runner,
   });
-  writeTextFile(
-    codexConfigPath,
-    buildDispatcherCodexConfigToml({
-      codexHomeConfigPath: codexConfigPath,
-      model: answers.codexModel,
-      marketplaceName: answers.codexMarketplaceName,
-      marketplaceSource: answers.codexMarketplaceSource,
-      pluginRef: answers.codexPluginRef,
-    }),
-    ledger,
-    'dispatcher private Codex config',
-    { mode: 0o600, dryRun: answers.dryRun },
-  );
 
   await installClaudemuxPlugin({
-    answers,
+    answers: effectiveAnswers,
     codexHome,
     ledger,
     runner,
   });
 
-  registerDispatcher(answers, ledger);
+  registerDispatcher(effectiveAnswers, ledger);
 
-  const doctor = runDispatcherDoctor(answers, dreamuxConfig, env);
-  if (!answers.dryRun && !doctor.ok) {
-    throw new Error(formatDoctorFailure(answers, doctor));
+  const doctor = runDispatcherDoctor(effectiveAnswers, dreamuxConfig, env);
+  if (!effectiveAnswers.dryRun && !doctor.ok) {
+    throw new Error(formatDoctorFailure(effectiveAnswers, doctor));
   }
 
-  const service = answers.registerService
+  const service = effectiveAnswers.registerService
     ? await installUserService({
-        answers,
+        answers: effectiveAnswers,
         ledger,
         runner,
         platform: options.platform,
@@ -157,6 +148,13 @@ export async function runOnboard(
     doctor,
     service,
   };
+}
+
+function readExistingDreamuxConfig(configDir: string) {
+  const configPath = globalConfigFile({ configDir });
+  assertNoLegacyTomlOnly({ configDir });
+  if (!existsSync(configPath)) return undefined;
+  return loadConfig({ configDir }).config;
 }
 
 function registerDispatcher(
@@ -178,9 +176,9 @@ function registerDispatcher(
     new DispatcherRepo(db).upsert({
       dispatcher_id: answers.dispatcherId,
       bot_app_id: answers.botAppId,
-      bot_secret_ref: answers.botSecretRef,
+      bot_secret_ref: dispatcherBotSecretRef(answers.dispatcherId),
       codex_args_json: dispatcherCodexArgsJson(),
-      codex_cwd: dispatcherCodexCwd(answers.dispatcherId),
+      codex_cwd: answers.dispatcherCwd,
     });
   } finally {
     db.close();
@@ -223,27 +221,17 @@ function formatDoctorFailure(
   doctor: DispatcherCodexHomeDoctorResult,
 ): string {
   const lines = [
-    `dispatcher '${answers.dispatcherId}' private CODEX_HOME is not ready`,
+    `dispatcher '${answers.dispatcherId}' Codex home is not ready`,
     ...doctor.errors.map((error) => `- ${error}`),
   ];
   if (
     answers.registerService &&
-    doctor.errors.some((error) => error.includes('missing dispatcher Codex auth state'))
+    doctor.errors.some((error) => error.includes('missing Codex auth state'))
   ) {
     lines.push(
       '- managed service environments do not inherit your interactive shell auth token',
-      `- authenticate the private dispatcher Codex home before registering the service: CODEX_HOME=${doctor.context.codexHome} ${answers.codexBin} login`,
+      `- authenticate the Codex home before registering the service: CODEX_HOME=${doctor.context.codexHome} ${answers.codexBin} login`,
     );
   }
   return lines.join('\n');
-}
-
-function preflightAuth(answers: OnboardAnswers, env: NodeJS.ProcessEnv): void {
-  if (answers.dryRun) return;
-  const value = env[answers.authEnvVar];
-  if (value !== undefined && value.trim() !== '') return;
-  throw new Error(
-    `missing dispatcher Codex auth env var ${answers.authEnvVar}; ` +
-      'onboard does not write API secrets into the private CODEX_HOME',
-  );
 }

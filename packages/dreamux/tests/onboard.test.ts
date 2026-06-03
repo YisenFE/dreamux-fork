@@ -10,8 +10,6 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { parse as parseToml } from 'smol-toml';
-
 import { DispatcherRepo } from '../src/db/repository.js';
 import { openDatabase } from '../src/db/schema.js';
 import { runOnboard } from '../src/onboard/run.js';
@@ -166,13 +164,7 @@ source_type = "github"
 }
 
 function writePrivateCodexAuth(answers: OnboardAnswers): void {
-  const authPath = join(
-    answers.runtimeDir,
-    'dispatchers',
-    answers.dispatcherId,
-    'codex-home',
-    'auth.json',
-  );
+  const authPath = join(dispatcherCodexHome(answers.dispatcherId), 'auth.json');
   mkdirSync(dirname(authPath), { recursive: true });
   writeFileSync(authPath, '{}', { mode: 0o600 });
 }
@@ -208,17 +200,22 @@ function countCalls(
 
 describe('dreamux onboard', () => {
   let root: string;
+  let previousCodexHome: string | undefined;
 
   beforeEach(() => {
     root = mkdtempSync(join(homedir(), '.dreamux-onboard-'));
+    previousCodexHome = process.env['CODEX_HOME'];
+    process.env['CODEX_HOME'] = join(root, 'codex');
   });
 
   afterEach(() => {
+    if (previousCodexHome === undefined) delete process.env['CODEX_HOME'];
+    else process.env['CODEX_HOME'] = previousCodexHome;
     resetRuntimeConfig();
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('writes private dispatcher state, records subprocess files, and passes the serve doctor', async () => {
+  it('writes dispatcher state, records subprocess files, and passes the serve doctor', async () => {
     const runner = new FakeRunner();
     const answers = testAnswers({
       configDir: join(root, 'config'),
@@ -226,7 +223,7 @@ describe('dreamux onboard', () => {
       claudeConfigDir: join(root, 'claude'),
       dreamuxBin: '/usr/local/bin/dreamux',
       botAppId: 'app-test',
-      botSecretRef: 'env:DREAMUX_TEST_BOT_SECRET',
+      botAppSecret: 'secret-test',
     });
     writePrivateCodexAuth(answers);
 
@@ -281,21 +278,12 @@ describe('dreamux onboard', () => {
       join(root, 'claude'),
     );
 
-    const privateConfig = parseToml(
-      readFileSync(dispatcherCodexConfigPath('flow'), 'utf8'),
-    ) as Record<string, unknown>;
-    expect(privateConfig['model']).toBe('gpt-test');
-    expect(privateConfig['approval_policy']).toBe('never');
-    expect(privateConfig['sandbox_mode']).toBe('workspace-write');
-    expect(privateConfig['default_permissions']).toBe('dreamux-dispatcher');
-    expect(privateConfig).toMatchObject({
-      sandbox_workspace_write: { network_access: true },
-      permissions: {
-        'dreamux-dispatcher': { network: { enabled: true } },
-      },
-      plugins: {
-        'codexmux@dreamux': { enabled: true },
-      },
+    const dreamuxConfig = JSON.parse(
+      readFileSync(join(root, 'config', 'config.json'), 'utf8'),
+    ) as Record<string, any>;
+    expect(dreamuxConfig['feishu']['bots']['flow']).toEqual({
+      app_id: 'app-test',
+      app_secret: 'secret-test',
     });
     expect(
       existsSync(
@@ -316,9 +304,10 @@ describe('dreamux onboard', () => {
       expect(row).toMatchObject({
         dispatcher_id: 'flow',
         bot_app_id: 'app-test',
-        bot_secret_ref: 'env:DREAMUX_TEST_BOT_SECRET',
+        bot_secret_ref: 'config:flow',
         status: 'declared',
         enabled: 1,
+        codex_cwd: join(root, 'dispatcher-cwd'),
       });
       expect(JSON.parse(row?.codex_args_json ?? '{}')).toEqual({
         approvalPolicy: 'never',
@@ -330,7 +319,7 @@ describe('dreamux onboard', () => {
     }
 
     const ledger = new Map(result.files.map((entry) => [entry.path, entry]));
-    expect(ledger.get(join(root, 'config', 'config.toml'))?.status).toBe(
+    expect(ledger.get(join(root, 'config', 'config.json'))?.status).toBe(
       'created',
     );
     expect(ledger.get(dispatcherCodexConfigPath('flow'))?.status).toBe(
@@ -338,9 +327,6 @@ describe('dreamux onboard', () => {
     );
     expect(ledger.get(dispatcherCodexConfigPath('flow'))?.reason).toContain(
       'codex plugin install',
-    );
-    expect(ledger.get(dispatcherCodexConfigPath('flow'))?.reason).toContain(
-      'dispatcher private Codex config',
     );
     expect(
       ledger.get(
@@ -430,6 +416,96 @@ describe('dreamux onboard', () => {
     expect(countCalls(runner, 'launchctl', ['kickstart'])).toBe(2);
   });
 
+  it('preserves existing config globals and other Feishu bots on rerun', async () => {
+    const runner = new FakeRunner();
+    const existingRuntimeDir = join(root, 'existing-runtime');
+    const ignoredRuntimeDir = join(root, 'ignored-runtime');
+    const configDir = join(root, 'config');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'config.json'),
+      JSON.stringify({
+        runtime_dir: existingRuntimeDir,
+        admin_socket: join(root, 'admin.sock'),
+        codex: {
+          approval_policy: 'on-failure',
+          sandbox_mode: 'danger-full-access',
+          extra_args: ['--model', 'local-default'],
+          initialize_timeout_ms: 12345,
+        },
+        outbound: {
+          retries: 7,
+          retry_delay_ms: 321,
+        },
+        feishu: {
+          bots: {
+            flow: {
+              app_id: 'app-flow',
+              app_secret: 'secret-flow',
+            },
+          },
+        },
+      }),
+    );
+    const answers = testAnswers({
+      configDir,
+      runtimeDir: ignoredRuntimeDir,
+      dispatcherId: 'docs',
+      dispatcherCwd: join(root, 'docs-cwd'),
+      claudeConfigDir: join(root, 'claude'),
+      registerService: false,
+      botAppId: 'app-docs',
+      botAppSecret: 'secret-docs',
+    });
+
+    await runOnboard({
+      answers,
+      runner,
+      platform: 'linux',
+      homeDir: join(root, 'home'),
+      env: { CODEX_ACCESS_TOKEN: 'interactive-token-test' },
+    });
+
+    const saved = JSON.parse(
+      readFileSync(join(configDir, 'config.json'), 'utf8'),
+    ) as Record<string, any>;
+    expect(saved['runtime_dir']).toBe(existingRuntimeDir);
+    expect(saved['admin_socket']).toBe(join(root, 'admin.sock'));
+    expect(saved['codex']).toMatchObject({
+      approval_policy: 'on-failure',
+      sandbox_mode: 'danger-full-access',
+      extra_args: ['--model', 'local-default'],
+      initialize_timeout_ms: 12345,
+    });
+    expect(saved['outbound']).toEqual({
+      retries: 7,
+      retry_delay_ms: 321,
+    });
+    expect(saved['feishu']['bots']).toEqual({
+      flow: {
+        app_id: 'app-flow',
+        app_secret: 'secret-flow',
+      },
+      docs: {
+        app_id: 'app-docs',
+        app_secret: 'secret-docs',
+      },
+    });
+    expect(existsSync(ignoredRuntimeDir)).toBe(false);
+
+    const db = openDatabase({ path: join(existingRuntimeDir, 'state.db') });
+    try {
+      expect(new DispatcherRepo(db).get('docs')).toMatchObject({
+        dispatcher_id: 'docs',
+        bot_app_id: 'app-docs',
+        bot_secret_ref: 'config:docs',
+        codex_cwd: join(root, 'docs-cwd'),
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   it('does not re-add an existing Claude marketplace before installing the plugin', async () => {
     const runner = new FakeRunner();
     const answers = testAnswers({
@@ -464,6 +540,21 @@ describe('dreamux onboard', () => {
       'non-interactive onboard requires --bot-app-id',
     );
   });
+
+  it('defaults non-interactive dispatcher cwd to the current working directory', () => {
+    const answers = answersFromOptions(
+      {
+        yes: true,
+        configDir: join(root, 'config'),
+        runtimeDir: join(root, 'runtime'),
+        botAppId: 'app-test',
+        botAppSecret: 'secret-test',
+      },
+      false,
+    );
+
+    expect(answers.dispatcherCwd).toBe(process.cwd());
+  });
 });
 
 function testAnswers(overrides: Partial<OnboardAnswers>): OnboardAnswers {
@@ -471,10 +562,8 @@ function testAnswers(overrides: Partial<OnboardAnswers>): OnboardAnswers {
     configDir: join(rootForTest(overrides), 'config'),
     runtimeDir: join(rootForTest(overrides), 'runtime'),
     dispatcherId: 'flow',
+    dispatcherCwd: join(rootForTest(overrides), 'dispatcher-cwd'),
     codexBin: 'codex',
-    codexModel: 'gpt-test',
-    codexProvider: 'openai',
-    authEnvVar: 'CODEX_ACCESS_TOKEN',
     codexMarketplaceSource: 'excitedjs/dreamux',
     codexMarketplaceSparse: [
       '.agents/plugins',
@@ -489,7 +578,7 @@ function testAnswers(overrides: Partial<OnboardAnswers>): OnboardAnswers {
     claudeMarketplaceName: 'claudemux',
     claudePluginRef: 'claudemux@claudemux',
     botAppId: 'app-test',
-    botSecretRef: 'env:DREAMUX_TEST_BOT_SECRET',
+    botAppSecret: 'secret-test',
     registerService: true,
     startService: true,
     dreamuxBin: '/usr/local/bin/dreamux',
