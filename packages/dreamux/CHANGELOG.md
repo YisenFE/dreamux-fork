@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 17:58:38 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 18:47:15 GMT and should not be manually modified.
+
+## 0.6.1
+Thu, 04 Jun 2026 18:47:15 GMT
+
+### Patches
+
+- Inject each dispatcher's per-dispatcher channel logger into its Feishu bot/transport, so the transport's Lark SDK and WebSocket connection diagnostics land in logs/feishu-channel/<id>.log alongside the host's own channel decisions (issue #74).
 
 ## 0.6.0
 Thu, 04 Jun 2026 17:58:38 GMT

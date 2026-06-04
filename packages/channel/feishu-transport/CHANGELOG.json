@@ -2,6 +2,18 @@
   "name": "@excitedjs/feishu-transport",
   "entries": [
     {
+      "version": "0.2.0",
+      "tag": "@excitedjs/feishu-transport_v0.2.0",
+      "date": "Thu, 04 Jun 2026 18:47:15 GMT",
+      "comments": {
+        "minor": [
+          {
+            "comment": "Add an explicit, additive `logger?` option to `FeishuTransportOptions` (a package-owned minimal `TransportLogger` interface) so a host can fold the transport's own diagnostics — Lark SDK logging, WebSocket connection lifecycle, and best-effort doc-comment/metadata/bot-info/socket-close failures — into its per-component log. Instance-level: each transport derives its SDK and connection sinks from the injected logger. With no logger the historical stderr behavior is preserved byte-for-byte (issue #74)."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.1.0",
       "tag": "@excitedjs/feishu-transport_v0.1.0",
       "date": "Thu, 04 Jun 2026 05:00:52 GMT",
