@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   DISPATCHER_APP_SERVER_SOCKET_PATH_MAX_BYTES,
@@ -12,45 +12,38 @@ import {
 import { BUILT_IN_DEFAULTS } from '../src/runtime/config.js';
 import {
   dispatcherAppServerControlDir,
-  dispatcherCodexConfigPath,
+  dispatcherCodexCwd,
   dispatcherCodexHome,
-  dispatcherCodexPluginsDir,
+  dispatcherWorkspaceSkillPath,
   dispatcherSocketPath,
   resetRuntimeConfig,
   setRuntimeConfig,
 } from '../src/runtime/paths.js';
 
-const VALID_CONFIG = `[marketplaces.dreamux]
-source = "public"
-
-	[plugins.codexmux]
-	enabled = true
-	`;
-
-describe('operator Codex home doctor', () => {
+describe('global Codex home doctor', () => {
   let runtimeDir: string;
-  let previousCodexHome: string | undefined;
+  let previousHome: string | undefined;
 
   beforeEach(() => {
     runtimeDir = mkdtempSync(join(homedir(), '.dreamux-test-'));
-    previousCodexHome = process.env['CODEX_HOME'];
-    process.env['CODEX_HOME'] = join(runtimeDir, 'codex-home');
-    setRuntimeConfig({ ...BUILT_IN_DEFAULTS, runtime_dir: runtimeDir });
+    previousHome = process.env['HOME'];
+    process.env['HOME'] = join(runtimeDir, 'home');
+    setRuntimeConfig(BUILT_IN_DEFAULTS);
   });
 
   afterEach(() => {
-    if (previousCodexHome === undefined) delete process.env['CODEX_HOME'];
-    else process.env['CODEX_HOME'] = previousCodexHome;
+    if (previousHome === undefined) delete process.env['HOME'];
+    else process.env['HOME'] = previousHome;
     resetRuntimeConfig();
     rmSync(runtimeDir, { recursive: true, force: true });
   });
 
   it('places app-server sockets under the dreamux dispatcher runtime directory', () => {
     expect(dispatcherSocketPath('flow')).toBe(
-      join(dispatcherAppServerControlDir('flow'), 'as.sock'),
+      join(dispatcherAppServerControlDir('flow'), 'codex.sock'),
     );
     expect(dispatcherSocketPath('flow')).toContain(
-      join('dispatchers', 'flow', 'app-server-control'),
+      join('.dreamux', 'state', 'flow'),
     );
     expect(dispatcherSocketPath('flow')).not.toMatch(/^\/tmp(?:\/|$)/);
     expect(Buffer.byteLength(dispatcherSocketPath('frontend-service'), 'utf8'))
@@ -63,16 +56,15 @@ describe('operator Codex home doctor', () => {
     expect(result.ok).toBe(false);
     expect(result.errors).toEqual(
       expect.arrayContaining([
-        expect.stringContaining('missing Codex config'),
         expect.stringContaining('missing Codex home directory'),
-        expect.stringContaining('missing codexmux plugin'),
+        expect.stringContaining('missing dispatcher skill'),
         expect.stringContaining('missing Codex auth state'),
       ]),
     );
   });
 
-  it('accepts a minimal operator Codex home prepared by onboard', () => {
-    writeDispatcherHome('flow', VALID_CONFIG);
+  it('accepts a minimal global Codex home prepared by onboard', () => {
+    writeDispatcherHome('flow');
 
     const result = validateDispatcherCodexHome('flow', { env: {} });
 
@@ -80,13 +72,8 @@ describe('operator Codex home doctor', () => {
     expect(result.errors).toEqual([]);
   });
 
-  it('does not require dispatcher-specific network config in the operator Codex home', () => {
-    writeDispatcherHome(
-      'flow',
-      `[marketplaces.dreamux]
-source = "public"
-`,
-    );
+  it('does not require a Codex config file in the global Codex home', () => {
+    writeDispatcherHome('flow');
 
     const result = validateDispatcherCodexHome('flow', { env: {} });
 
@@ -95,7 +82,7 @@ source = "public"
   });
 
   it('ignores runtime CLI overrides when checking static Codex home readiness', () => {
-    writeDispatcherHome('flow', VALID_CONFIG);
+    writeDispatcherHome('flow');
 
     const result = validateDispatcherCodexHome('flow', {
       codexCliArgs: [
@@ -111,24 +98,17 @@ source = "public"
   });
 
   it('rejects too-long app-server socket paths before bind', () => {
-    setRuntimeConfig({
-      ...BUILT_IN_DEFAULTS,
-      runtime_dir: join(runtimeDir, 'runtime-root-with-a-long-custom-name'),
-    });
-    writeDispatcherHome('dispatcher-with-long-id', VALID_CONFIG);
+    process.env['HOME'] = join(runtimeDir, 'h'.repeat(90));
 
-    const result = validateDispatcherCodexHome('dispatcher-with-long-id', {
-      env: {},
-    });
-
-    expect(result.ok).toBe(false);
-    expect(formatDispatcherCodexHomeErrors(result)).toContain(
-      'socket path is too long',
+    expect(() =>
+      validateDispatcherCodexHome('dispatcher-with-long-id', { env: {} }),
+    ).toThrow(
+      /Codex socket path is too long/,
     );
   });
 
   it('requires auth environment variables to be non-empty and accepts CODEX_ACCESS_TOKEN', () => {
-    writeDispatcherHome('flow', VALID_CONFIG, { writeAuth: false });
+    writeDispatcherHome('flow', { writeAuth: false });
 
     const emptyAuth = validateDispatcherCodexHome('flow', {
       env: { OPENAI_API_KEY: '' },
@@ -144,56 +124,52 @@ source = "public"
     expect(accessToken.ok).toBe(true);
   });
 
-  it('honors caller-provided doctor context paths', () => {
-    writeDispatcherHome('flow', VALID_CONFIG);
+  it('reports invalid caller-provided Codex config paths', () => {
+    writeDispatcherHome('flow');
+    const badConfigPath = join(runtimeDir, 'bad-config.toml');
+    writeFileSync(badConfigPath, 'not toml =');
     const context = dispatcherCodexHomeDoctorContext('flow', {
       codexCliArgs: ['-c', 'sandbox_mode=danger-full-access'],
     });
 
     const result = validateDispatcherCodexHome({
       ...context,
-      configPath: join(runtimeDir, 'missing-config.toml'),
+      configPath: badConfigPath,
     }, { env: {} });
 
     expect(result.ok).toBe(false);
     expect(formatDispatcherCodexHomeErrors(result)).toContain(
-      join(runtimeDir, 'missing-config.toml'),
+      badConfigPath,
     );
   });
 
-  it('rejects dispatcher homes without codexmux installed', () => {
-    writeDispatcherHome('flow', VALID_CONFIG, { installCodexmux: false });
+  it('rejects missing workspace-local dispatcher skills', () => {
+    writeDispatcherHome('flow', { installDispatcherSkill: false });
 
     const result = validateDispatcherCodexHome('flow', { env: {} });
 
     expect(result.ok).toBe(false);
     expect(formatDispatcherCodexHomeErrors(result)).toContain(
-      'missing codexmux plugin',
+      'missing dispatcher skill',
     );
   });
 });
 
 function writeDispatcherHome(
   dispatcherId: string,
-  config: string,
-  options: { installCodexmux?: boolean; writeAuth?: boolean } = {},
+  options: { installDispatcherSkill?: boolean; writeAuth?: boolean } = {},
 ): void {
   mkdirSync(dispatcherCodexHome(dispatcherId), { recursive: true });
-  writeFileSync(dispatcherCodexConfigPath(dispatcherId), config, { mode: 0o600 });
   if (options.writeAuth !== false) {
     writeFileSync(join(dispatcherCodexHome(dispatcherId), 'auth.json'), '{}', {
       mode: 0o600,
     });
   }
 
-  if (options.installCodexmux === false) return;
-  mkdirSync(
-    join(
-      dispatcherCodexPluginsDir(dispatcherId),
-      'cache',
-      'dreamux',
-      'codexmux',
-    ),
-    { recursive: true },
-  );
+  if (options.installDispatcherSkill === false) return;
+  const skillPath = dispatcherWorkspaceSkillPath(dispatcherCodexCwd(dispatcherId));
+  mkdirSync(dirname(skillPath), {
+    recursive: true,
+  });
+  writeFileSync(skillPath, '# test skill\n');
 }

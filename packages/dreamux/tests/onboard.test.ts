@@ -10,8 +10,6 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { DispatcherRepo } from '../src/db/repository.js';
-import { openDatabase } from '../src/db/schema.js';
 import { runOnboard } from '../src/onboard/run.js';
 import {
   answersFromOptions,
@@ -19,9 +17,9 @@ import {
 } from '../src/onboard/wizard.js';
 import type { CommandRunner, OnboardAnswers } from '../src/onboard/types.js';
 import {
-  dispatcherCodexConfigPath,
   dispatcherCodexHome,
-  dispatcherCodexPluginsDir,
+  dispatcherWorkspaceSkillPath,
+  logsRoot,
   resetRuntimeConfig,
 } from '../src/runtime/paths.js';
 
@@ -51,72 +49,6 @@ class FakeRunner implements CommandRunner {
     });
     if (options.dryRun) return;
 
-    if (
-      command === 'codex' &&
-      args.join(' ') ===
-        'plugin marketplace add excitedjs/dreamux --sparse .agents/plugins --sparse codex-marketplace/plugins/codexmux'
-    ) {
-      const codexHome = requiredEnv(options.env, 'CODEX_HOME');
-      mkdirSync(codexHome, { recursive: true });
-      writeFileSync(
-        join(codexHome, 'config.toml'),
-        `[marketplaces.dreamux]
-source = "excitedjs/dreamux"
-source_type = "github"
-`,
-      );
-      return;
-    }
-    if (command === 'codex' && args.join(' ') === 'plugin add codexmux@dreamux') {
-      const codexHome = requiredEnv(options.env, 'CODEX_HOME');
-      const pluginRoot = join(
-        codexHome,
-        'plugins',
-        'cache',
-        'dreamux',
-        'codexmux',
-        '0.1.0',
-      );
-      mkdirSync(pluginRoot, { recursive: true });
-      writeFileSync(join(pluginRoot, 'plugin.json'), '{"name":"codexmux"}');
-      return;
-    }
-    if (command === 'claude' && args.join(' ') === 'plugin marketplace add excitedjs/claudemux --scope user') {
-      const claudeConfigDir = requiredEnv(options.env, 'CLAUDE_CONFIG_DIR');
-      mkdirSync(join(claudeConfigDir, 'plugins'), { recursive: true });
-      writeFileSync(
-        join(claudeConfigDir, 'settings.json'),
-        JSON.stringify({
-          extraKnownMarketplaces: {
-            claudemux: {
-              source: {
-                source: 'github',
-                repo: 'excitedjs/claudemux',
-              },
-            },
-          },
-        }),
-      );
-      writeFileSync(
-        join(claudeConfigDir, 'plugins', 'known_marketplaces.json'),
-        JSON.stringify({
-          claudemux: {
-            source: {
-              source: 'github',
-              repo: 'excitedjs/claudemux',
-            },
-          },
-        }),
-      );
-      return;
-    }
-    if (command === 'claude' && args.join(' ') === 'plugin install claudemux@claudemux --scope user') {
-      const claudeConfigDir = requiredEnv(options.env, 'CLAUDE_CONFIG_DIR');
-      const pluginDir = join(claudeConfigDir, 'plugins', 'claudemux');
-      mkdirSync(pluginDir, { recursive: true });
-      writeFileSync(join(pluginDir, 'plugin.json'), '{"name":"claudemux"}');
-      return;
-    }
     if (command === 'launchctl' && args[0] === 'bootstrap') {
       this.launchdLoaded = true;
       return;
@@ -151,40 +83,15 @@ source_type = "github"
       dryRun?: boolean;
     } = {},
   ): Promise<string> {
-    void args;
-    void options.cwd;
-    void options.dryRun;
-    if (command !== 'claude') return '';
-    const claudeConfigDir = requiredEnv(options.env, 'CLAUDE_CONFIG_DIR');
-    const installed = existsSync(
-      join(claudeConfigDir, 'plugins', 'claudemux', 'plugin.json'),
-    );
-    return installed ? '[{"name":"claudemux"}]' : '[]';
+    void options;
+    throw new Error(`unexpected capture: ${command} ${args.join(' ')}`);
   }
 }
 
-function writePrivateCodexAuth(answers: OnboardAnswers): void {
+function writeGlobalCodexAuth(answers: OnboardAnswers): void {
   const authPath = join(dispatcherCodexHome(answers.dispatcherId), 'auth.json');
   mkdirSync(dirname(authPath), { recursive: true });
   writeFileSync(authPath, '{}', { mode: 0o600 });
-}
-
-function writeClaudeMarketplace(answers: OnboardAnswers): void {
-  const settingsPath = join(answers.claudeConfigDir, 'settings.json');
-  mkdirSync(dirname(settingsPath), { recursive: true });
-  writeFileSync(
-    settingsPath,
-    JSON.stringify({
-      extraKnownMarketplaces: {
-        claudemux: {
-          source: {
-            source: 'github',
-            repo: answers.claudeMarketplaceSource,
-          },
-        },
-      },
-    }),
-  );
 }
 
 function countCalls(
@@ -200,17 +107,17 @@ function countCalls(
 
 describe('dreamux onboard', () => {
   let root: string;
-  let previousCodexHome: string | undefined;
+  let previousHome: string | undefined;
 
   beforeEach(() => {
     root = mkdtempSync(join(homedir(), '.dreamux-onboard-'));
-    previousCodexHome = process.env['CODEX_HOME'];
-    process.env['CODEX_HOME'] = join(root, 'codex');
+    previousHome = process.env['HOME'];
+    process.env['HOME'] = join(root, 'home');
   });
 
   afterEach(() => {
-    if (previousCodexHome === undefined) delete process.env['CODEX_HOME'];
-    else process.env['CODEX_HOME'] = previousCodexHome;
+    if (previousHome === undefined) delete process.env['HOME'];
+    else process.env['HOME'] = previousHome;
     resetRuntimeConfig();
     rmSync(root, { recursive: true, force: true });
   });
@@ -220,12 +127,11 @@ describe('dreamux onboard', () => {
     const answers = testAnswers({
       configDir: join(root, 'config'),
       runtimeDir: join(root, 'runtime'),
-      claudeConfigDir: join(root, 'claude'),
       dreamuxBin: '/usr/local/bin/dreamux',
       botAppId: 'app-test',
       botAppSecret: 'secret-test',
     });
-    writePrivateCodexAuth(answers);
+    writeGlobalCodexAuth(answers);
 
     const result = await runOnboard({
       answers,
@@ -242,107 +148,46 @@ describe('dreamux onboard', () => {
       started: true,
     });
     expect(runner.calls.map((call) => [call.command, call.args])).toEqual([
-      [
-        'codex',
-        [
-          'plugin',
-          'marketplace',
-          'add',
-          'excitedjs/dreamux',
-          '--sparse',
-          '.agents/plugins',
-          '--sparse',
-          'codex-marketplace/plugins/codexmux',
-        ],
-      ],
-      ['codex', ['plugin', 'add', 'codexmux@dreamux']],
-      [
-        'claude',
-        [
-          'plugin',
-          'marketplace',
-          'add',
-          'excitedjs/claudemux',
-          '--scope',
-          'user',
-        ],
-      ],
-      ['claude', ['plugin', 'install', 'claudemux@claudemux', '--scope', 'user']],
       ['systemctl', ['--user', 'daemon-reload']],
       ['systemctl', ['--user', 'enable', '--now', 'dreamux.service']],
     ]);
-    expect(runner.calls[0]?.env?.['CODEX_HOME']).toBe(
-      dispatcherCodexHome('flow'),
-    );
-    expect(runner.calls[2]?.env?.['CLAUDE_CONFIG_DIR']).toBe(
-      join(root, 'claude'),
-    );
 
     const dreamuxConfig = JSON.parse(
       readFileSync(join(root, 'config', 'config.json'), 'utf8'),
     ) as Record<string, any>;
-    expect(dreamuxConfig['feishu']['bots']['flow']).toEqual({
-      app_id: 'app-test',
-      app_secret: 'secret-test',
-    });
+    expect(dreamuxConfig['dispatchers']).toEqual([{
+      id: 'flow',
+      cwd: join(root, 'dispatcher-cwd'),
+      enabled: true,
+      feishu: {
+        app_id: 'app-test',
+        app_secret: 'secret-test',
+      },
+      codex: {
+        approval_policy: 'never',
+        sandbox_mode: 'workspace-write',
+        extra_args: [],
+        extra_env: {},
+      },
+    }]);
+    expect(dreamuxConfig).not.toHaveProperty('feishu');
+    expect(dreamuxConfig).not.toHaveProperty('runtime_dir');
+    expect(dreamuxConfig).not.toHaveProperty('admin_socket');
+    expect(dreamuxConfig).not.toHaveProperty('outbound');
+    expect(
+      existsSync(dispatcherWorkspaceSkillPath(answers.dispatcherCwd)),
+    ).toBe(true);
     expect(
       existsSync(
-        join(
-          dispatcherCodexPluginsDir('flow'),
-          'cache',
-          'dreamux',
-          'codexmux',
-          '0.1.0',
-          'plugin.json',
-        ),
+        join(dispatcherCodexHome('flow'), 'skills', 'dispatcher', 'SKILL.md'),
       ),
-    ).toBe(true);
-
-    const db = openDatabase({ path: join(root, 'runtime', 'state.db') });
-    try {
-      const row = new DispatcherRepo(db).get('flow');
-      expect(row).toMatchObject({
-        dispatcher_id: 'flow',
-        bot_app_id: 'app-test',
-        bot_secret_ref: 'config:flow',
-        status: 'declared',
-        enabled: 1,
-        codex_cwd: join(root, 'dispatcher-cwd'),
-      });
-      expect(JSON.parse(row?.codex_args_json ?? '{}')).toEqual({
-        approvalPolicy: 'never',
-        sandboxMode: 'workspace-write',
-        extraArgs: [],
-      });
-    } finally {
-      db.close();
-    }
-
+    ).toBe(false);
     const ledger = new Map(result.files.map((entry) => [entry.path, entry]));
     expect(ledger.get(join(root, 'config', 'config.json'))?.status).toBe(
       'created',
     );
-    expect(ledger.get(dispatcherCodexConfigPath('flow'))?.status).toBe(
-      'created',
-    );
-    expect(ledger.get(dispatcherCodexConfigPath('flow'))?.reason).toContain(
-      'codex plugin install',
-    );
     expect(
-      ledger.get(
-        join(
-          dispatcherCodexPluginsDir('flow'),
-          'cache',
-          'dreamux',
-          'codexmux',
-          '0.1.0',
-          'plugin.json',
-        ),
-      )?.status,
-    ).toBe('created');
-    expect(
-      ledger.get(join(root, 'claude', 'plugins', 'claudemux', 'plugin.json'))
-        ?.status,
+      ledger.get(dispatcherWorkspaceSkillPath(answers.dispatcherCwd))?.status,
     ).toBe('created');
     expect(
       ledger.get(
@@ -350,10 +195,10 @@ describe('dreamux onboard', () => {
       )?.status,
     ).toBe('created');
     expect(
-      ledger.get(join(root, 'runtime', 'logs', 'daemon.stdout.log'))?.status,
+      ledger.get(join(logsRoot(), 'daemon.stdout.log'))?.status,
     ).toBe('created');
-    expect(ledger.get(join(root, 'runtime', 'state.db'))?.status).toBe(
-      'created',
+    expect(result.files.map((entry) => entry.reason)).not.toContain(
+      'dispatcher database',
     );
   });
 
@@ -362,7 +207,6 @@ describe('dreamux onboard', () => {
     const answers = testAnswers({
       configDir: join(root, 'config'),
       runtimeDir: join(root, 'runtime'),
-      claudeConfigDir: join(root, 'claude'),
       registerService: true,
     });
 
@@ -379,16 +223,15 @@ describe('dreamux onboard', () => {
     );
   });
 
-  it('skips already-installed plugins and already-loaded launchd services on rerun', async () => {
+  it('rewrites workspace dispatcher skills and skips already-loaded launchd services on rerun', async () => {
     const runner = new FakeRunner();
     const answers = testAnswers({
       configDir: join(root, 'config'),
       runtimeDir: join(root, 'runtime'),
-      claudeConfigDir: join(root, 'claude'),
       registerService: true,
       startService: true,
     });
-    writePrivateCodexAuth(answers);
+    writeGlobalCodexAuth(answers);
 
     await runOnboard({
       answers,
@@ -407,52 +250,51 @@ describe('dreamux onboard', () => {
       env: {},
     });
 
-    expect(countCalls(runner, 'codex', ['plugin', 'marketplace', 'add'])).toBe(1);
-    expect(countCalls(runner, 'codex', ['plugin', 'add'])).toBe(1);
-    expect(countCalls(runner, 'claude', ['plugin', 'marketplace', 'add'])).toBe(1);
-    expect(countCalls(runner, 'claude', ['plugin', 'install'])).toBe(1);
+    expect(countCalls(runner, 'codex', ['plugin'])).toBe(0);
+    expect(countCalls(runner, 'claude', ['plugin'])).toBe(0);
     expect(countCalls(runner, 'launchctl', ['bootstrap'])).toBe(1);
     expect(countCalls(runner, 'launchctl', ['bootout'])).toBe(0);
     expect(countCalls(runner, 'launchctl', ['kickstart'])).toBe(2);
   });
 
-  it('preserves existing config globals and other Feishu bots on rerun', async () => {
+  it('preserves existing codex globals and other dispatchers on rerun', async () => {
     const runner = new FakeRunner();
-    const existingRuntimeDir = join(root, 'existing-runtime');
     const ignoredRuntimeDir = join(root, 'ignored-runtime');
     const configDir = join(root, 'config');
     mkdirSync(configDir, { recursive: true });
     writeFileSync(
       join(configDir, 'config.json'),
       JSON.stringify({
-        runtime_dir: existingRuntimeDir,
-        admin_socket: join(root, 'admin.sock'),
         codex: {
           approval_policy: 'on-failure',
           sandbox_mode: 'danger-full-access',
           extra_args: ['--model', 'local-default'],
           initialize_timeout_ms: 12345,
         },
-        outbound: {
-          retries: 7,
-          retry_delay_ms: 321,
-        },
-        feishu: {
-          bots: {
-            flow: {
+        dispatchers: [
+          {
+            id: 'flow',
+            cwd: join(root, 'flow-cwd'),
+            enabled: true,
+            feishu: {
               app_id: 'app-flow',
               app_secret: 'secret-flow',
             },
+            codex: {
+              approval_policy: null,
+              sandbox_mode: null,
+              extra_args: [],
+            },
           },
-        },
+        ],
       }),
+      { mode: 0o600 },
     );
     const answers = testAnswers({
       configDir,
       runtimeDir: ignoredRuntimeDir,
       dispatcherId: 'docs',
       dispatcherCwd: join(root, 'docs-cwd'),
-      claudeConfigDir: join(root, 'claude'),
       registerService: false,
       botAppId: 'app-docs',
       botAppSecret: 'secret-docs',
@@ -469,64 +311,103 @@ describe('dreamux onboard', () => {
     const saved = JSON.parse(
       readFileSync(join(configDir, 'config.json'), 'utf8'),
     ) as Record<string, any>;
-    expect(saved['runtime_dir']).toBe(existingRuntimeDir);
-    expect(saved['admin_socket']).toBe(join(root, 'admin.sock'));
+    expect(saved).not.toHaveProperty('runtime_dir');
+    expect(saved).not.toHaveProperty('admin_socket');
     expect(saved['codex']).toMatchObject({
       approval_policy: 'on-failure',
       sandbox_mode: 'danger-full-access',
       extra_args: ['--model', 'local-default'],
       initialize_timeout_ms: 12345,
     });
-    expect(saved['outbound']).toEqual({
-      retries: 7,
-      retry_delay_ms: 321,
-    });
-    expect(saved['feishu']['bots']).toEqual({
-      flow: {
-        app_id: 'app-flow',
-        app_secret: 'secret-flow',
+    expect(saved).not.toHaveProperty('outbound');
+    expect(saved).not.toHaveProperty('feishu');
+    expect(saved['dispatchers']).toEqual([
+      {
+        id: 'flow',
+        cwd: join(root, 'flow-cwd'),
+        enabled: true,
+        feishu: {
+          app_id: 'app-flow',
+          app_secret: 'secret-flow',
+        },
+        codex: {
+          approval_policy: null,
+          sandbox_mode: null,
+          extra_args: [],
+          extra_env: {},
+        },
       },
-      docs: {
-        app_id: 'app-docs',
-        app_secret: 'secret-docs',
+      {
+        id: 'docs',
+        cwd: join(root, 'docs-cwd'),
+        enabled: true,
+        feishu: {
+          app_id: 'app-docs',
+          app_secret: 'secret-docs',
+        },
+        codex: {
+          approval_policy: 'never',
+          sandbox_mode: 'workspace-write',
+          extra_args: [],
+          extra_env: {},
+        },
       },
-    });
+    ]);
     expect(existsSync(ignoredRuntimeDir)).toBe(false);
-
-    const db = openDatabase({ path: join(existingRuntimeDir, 'state.db') });
-    try {
-      expect(new DispatcherRepo(db).get('docs')).toMatchObject({
-        dispatcher_id: 'docs',
-        bot_app_id: 'app-docs',
-        bot_secret_ref: 'config:docs',
-        codex_cwd: join(root, 'docs-cwd'),
-      });
-    } finally {
-      db.close();
-    }
   });
 
-  it('does not re-add an existing Claude marketplace before installing the plugin', async () => {
+  it('rejects a new dispatcher that reuses an existing Feishu app_id', async () => {
     const runner = new FakeRunner();
-    const answers = testAnswers({
-      configDir: join(root, 'config'),
-      runtimeDir: join(root, 'runtime'),
-      claudeConfigDir: join(root, 'claude'),
-      registerService: true,
+    const configDir = join(root, 'config');
+    const existingConfig = JSON.stringify({
+      codex: {
+        bin: 'codex',
+        approval_policy: 'never',
+        sandbox_mode: 'workspace-write',
+        extra_args: [],
+        initialize_timeout_ms: 10000,
+      },
+      dispatchers: [
+        {
+          id: 'flow',
+          cwd: join(root, 'flow-cwd'),
+          enabled: false,
+          feishu: {
+            app_id: 'app-shared',
+            app_secret: 'secret-flow',
+          },
+          codex: {
+            approval_policy: null,
+            sandbox_mode: null,
+            extra_args: [],
+          },
+        },
+      ],
     });
-    writePrivateCodexAuth(answers);
-    writeClaudeMarketplace(answers);
-
-    await runOnboard({
-      answers,
-      runner,
-      platform: 'linux',
-      homeDir: join(root, 'home'),
-      env: {},
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'config.json'), existingConfig, {
+      mode: 0o600,
     });
 
-    expect(countCalls(runner, 'claude', ['plugin', 'marketplace', 'add'])).toBe(0);
-    expect(countCalls(runner, 'claude', ['plugin', 'install'])).toBe(1);
+    await expect(
+      runOnboard({
+        answers: testAnswers({
+          configDir,
+          dispatcherId: 'docs',
+          botAppId: 'app-shared',
+          botAppSecret: 'secret-docs',
+          registerService: false,
+        }),
+        runner,
+        platform: 'linux',
+        homeDir: join(root, 'home'),
+        env: {},
+      }),
+    ).rejects.toThrow(/duplicates dispatcher 'flow'/);
+
+    expect(readFileSync(join(configDir, 'config.json'), 'utf8')).toBe(
+      existingConfig,
+    );
   });
 
   it('fails non-interactive setup when required channel inputs are missing', () => {
@@ -564,19 +445,6 @@ function testAnswers(overrides: Partial<OnboardAnswers>): OnboardAnswers {
     dispatcherId: 'flow',
     dispatcherCwd: join(rootForTest(overrides), 'dispatcher-cwd'),
     codexBin: 'codex',
-    codexMarketplaceSource: 'excitedjs/dreamux',
-    codexMarketplaceSparse: [
-      '.agents/plugins',
-      'codex-marketplace/plugins/codexmux',
-    ],
-    codexMarketplaceName: 'dreamux',
-    codexPluginRef: 'codexmux@dreamux',
-    claudeBin: 'claude',
-    claudeConfigDir: join(rootForTest(overrides), 'claude'),
-    claudeMarketplaceSource: 'excitedjs/claudemux',
-    claudeMarketplaceSparse: [],
-    claudeMarketplaceName: 'claudemux',
-    claudePluginRef: 'claudemux@claudemux',
     botAppId: 'app-test',
     botAppSecret: 'secret-test',
     registerService: true,
@@ -591,12 +459,4 @@ function rootForTest(overrides: Partial<OnboardAnswers>): string {
   const fromConfig = overrides.configDir;
   if (fromConfig !== undefined) return join(fromConfig, '..');
   return homedir();
-}
-
-function requiredEnv(env: NodeJS.ProcessEnv | undefined, name: string): string {
-  const value = env?.[name];
-  if (value === undefined || value === '') {
-    throw new Error(`missing test env ${name}`);
-  }
-  return value;
 }

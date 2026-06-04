@@ -1,28 +1,33 @@
 import {
   existsSync,
   readFileSync,
-  readdirSync,
-  statSync,
 } from 'node:fs';
-import { basename, join, normalize, sep } from 'node:path';
+import { join, normalize, sep } from 'node:path';
 
 import { parse as parseToml, TomlError } from 'smol-toml';
 
 import {
+  DREAMUX_UNIX_SOCKET_PATH_MAX_BYTES,
   dispatcherAppServerControlDir,
+  dispatcherCodexCwd,
   dispatcherCodexConfigPath,
   dispatcherCodexHome,
-  dispatcherCodexPluginsDir,
+  dispatcherWorkspaceCodexSkillsDir,
+  dispatcherWorkspaceSkillPath,
   dispatcherSocketPath,
+  unixSocketPathFitsBudget,
 } from './paths.js';
 
-export const DISPATCHER_APP_SERVER_SOCKET_PATH_MAX_BYTES = 103;
+export const DISPATCHER_APP_SERVER_SOCKET_PATH_MAX_BYTES =
+  DREAMUX_UNIX_SOCKET_PATH_MAX_BYTES;
 
 export interface DispatcherCodexHomeDoctorContext {
   dispatcherId: string;
   codexHome: string;
   configPath: string;
-  pluginsDir: string;
+  dispatcherCwd: string;
+  skillsDir: string;
+  skillPath: string;
   appServerControlDir: string;
   socketPath: string;
   codexCliArgs: string[];
@@ -40,6 +45,7 @@ export type DispatcherCodexHomeDoctor = (
 
 interface DoctorContextOptions {
   codexCliArgs?: string[];
+  dispatcherCwd?: string;
 }
 
 interface DoctorOptions {
@@ -51,11 +57,14 @@ export function dispatcherCodexHomeDoctorContext(
   dispatcherId: string,
   options: DoctorContextOptions = {},
 ): DispatcherCodexHomeDoctorContext {
+  const dispatcherCwd = options.dispatcherCwd ?? dispatcherCodexCwd(dispatcherId);
   return {
     dispatcherId,
     codexHome: dispatcherCodexHome(dispatcherId),
     configPath: dispatcherCodexConfigPath(dispatcherId),
-    pluginsDir: dispatcherCodexPluginsDir(dispatcherId),
+    dispatcherCwd,
+    skillsDir: dispatcherWorkspaceCodexSkillsDir(dispatcherCwd),
+    skillPath: dispatcherWorkspaceSkillPath(dispatcherCwd),
     appServerControlDir: dispatcherAppServerControlDir(dispatcherId),
     socketPath: dispatcherSocketPath(dispatcherId),
     codexCliArgs: options.codexCliArgs ?? [],
@@ -78,9 +87,7 @@ export function validateDispatcherCodexHome(
   const errors: string[] = [];
   const env = options.env ?? process.env;
 
-  if (!existsSync(context.configPath)) {
-    errors.push(`missing Codex config: ${context.configPath}`);
-  } else {
+  if (existsSync(context.configPath)) {
     try {
       const parsed = parseToml(readFileSync(context.configPath, 'utf8'));
       if (!isRecord(parsed)) {
@@ -99,14 +106,14 @@ export function validateDispatcherCodexHome(
       `dispatcher app-server socket must not be under /tmp: ${context.socketPath}`,
     );
   }
-  if (!socketPathFitsUnixLimit(context.socketPath)) {
+  if (!unixSocketPathFitsBudget(context.socketPath)) {
     const bytes = Buffer.byteLength(context.socketPath, 'utf8');
     errors.push(
       `dispatcher app-server socket path is too long for Unix sockets (${bytes} bytes > ${DISPATCHER_APP_SERVER_SOCKET_PATH_MAX_BYTES} safe bytes): ${context.socketPath}`,
     );
   }
-  if (!codexmuxPluginExists(context.pluginsDir)) {
-    errors.push(`missing codexmux plugin under: ${context.pluginsDir}`);
+  if (!dispatcherSkillExists(context.skillPath)) {
+    errors.push(`missing dispatcher skill: ${context.skillPath}`);
   }
 
   if (!hasAuth(context.codexHome, env)) {
@@ -149,36 +156,8 @@ function formatTomlError(err: unknown, file: string): string {
   return `Codex config parse error in ${file}: ${msg}`;
 }
 
-function codexmuxPluginExists(root: string): boolean {
-  return hasPathSegment(root, 'codexmux', 5);
-}
-
-function hasPathSegment(root: string, segment: string, maxDepth: number): boolean {
-  if (!existsSync(root)) return false;
-  const stack: Array<{ path: string; depth: number }> = [{ path: root, depth: 0 }];
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (current === undefined) continue;
-    if (basename(current.path) === segment) return true;
-    if (current.depth >= maxDepth) continue;
-    let entries: string[];
-    try {
-      entries = readdirSync(current.path);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const child = join(current.path, entry);
-      try {
-        if (statSync(child).isDirectory()) {
-          stack.push({ path: child, depth: current.depth + 1 });
-        }
-      } catch {
-        /* ignore transient filesystem races */
-      }
-    }
-  }
-  return false;
+function dispatcherSkillExists(skillPath: string): boolean {
+  return existsSync(skillPath);
 }
 
 function hasAuth(codexHome: string, env: NodeJS.ProcessEnv): boolean {
@@ -188,13 +167,6 @@ function hasAuth(codexHome: string, env: NodeJS.ProcessEnv): boolean {
       const value = env[name];
       return value !== undefined && value.trim() !== '';
     },
-  );
-}
-
-function socketPathFitsUnixLimit(path: string): boolean {
-  return (
-    Buffer.byteLength(path, 'utf8') <=
-    DISPATCHER_APP_SERVER_SOCKET_PATH_MAX_BYTES
   );
 }
 

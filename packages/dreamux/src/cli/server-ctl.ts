@@ -1,17 +1,15 @@
 /**
  * `server-ctl` — admin CLI that talks to the server via Unix socket.
  *
- * Connects to the admin socket (CODEX_HOST_ADMIN_SOCKET or default), sends a
+ * Connects to the admin socket under ~/.dreamux/state/admin.sock, sends a
  * single NDJSON request, prints the response, exits.
  *
  * Usage:
  *   server-ctl server status
  *   server-ctl dispatcher list
- *   server-ctl dispatcher add --id flow --bot-app-id <APP_ID> --bot-secret-ref config:flow
  *   server-ctl dispatcher status --id flow
  *   server-ctl dispatcher start --id flow
  *   server-ctl dispatcher stop --id flow
- *   server-ctl dispatcher remove --id flow
  */
 
 import { connect, type Socket } from 'node:net';
@@ -176,15 +174,15 @@ function printHelp(programName = 'server-ctl'): void {
 Usage:
   ${programName} server status
   ${programName} dispatcher list
-  ${programName} dispatcher add --id <ID> --bot-app-id <APP_ID> \\
-                            --bot-secret-ref config:<ID> [--codex-args-json <JSON>] [--codex-cwd <PATH>]
   ${programName} dispatcher status --id <ID>
   ${programName} dispatcher start --id <ID>
   ${programName} dispatcher stop --id <ID>
-  ${programName} dispatcher remove --id <ID>
 
-Environment:
-  CODEX_HOST_ADMIN_SOCKET   override the admin socket path (default: ~/.codex-host/admin.sock)
+Dispatcher declarations live in ~/.dreamux/config.json dispatchers[].
+Edit config and restart dreamux serve to add or remove dispatchers.
+
+Admin socket:
+  ~/.dreamux/state/admin.sock
 `);
 }
 

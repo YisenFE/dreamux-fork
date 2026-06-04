@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -11,16 +12,25 @@ import { dirname, join } from 'node:path';
 
 import { runUninstall } from '../src/onboard/uninstall.js';
 import type { CommandRunner } from '../src/onboard/types.js';
+import {
+  dispatcherWorkspaceSkillPath,
+  logsRoot,
+  resetRuntimeConfig,
+  stateRoot,
+} from '../src/runtime/paths.js';
 
 class FakeRunner implements CommandRunner {
+  launchdLoaded = false;
   readonly calls: Array<{ command: string; args: string[] }> = [];
 
   async run(command: string, args: string[]): Promise<void> {
     this.calls.push({ command, args });
   }
 
-  async check(): Promise<boolean> {
-    return false;
+  async check(command: string, args: string[]): Promise<boolean> {
+    return command === 'launchctl' &&
+      args[0] === 'print' &&
+      this.launchdLoaded;
   }
 
   async capture(): Promise<string> {
@@ -30,33 +40,52 @@ class FakeRunner implements CommandRunner {
 
 describe('dreamux uninstall', () => {
   let root: string;
-  let previousCodexHome: string | undefined;
-  let previousClaudeConfigDir: string | undefined;
+  let previousHome: string | undefined;
 
   beforeEach(() => {
     root = mkdtempSync(join(homedir(), '.dreamux-uninstall-'));
-    previousCodexHome = process.env['CODEX_HOME'];
-    previousClaudeConfigDir = process.env['CLAUDE_CONFIG_DIR'];
+    previousHome = process.env['HOME'];
+    process.env['HOME'] = join(root, 'home');
   });
 
   afterEach(() => {
-    restoreEnv('CODEX_HOME', previousCodexHome);
-    restoreEnv('CLAUDE_CONFIG_DIR', previousClaudeConfigDir);
+    if (previousHome === undefined) delete process.env['HOME'];
+    else process.env['HOME'] = previousHome;
+    resetRuntimeConfig();
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('removes onboard-owned config, runtime, and user service files', async () => {
+  it('removes onboard-owned config, state, logs, and user service files', async () => {
     const configDir = join(root, 'config');
-    const runtimeDir = join(root, 'runtime');
     const homeDir = join(root, 'home');
     const servicePath = join(homeDir, '.config', 'systemd', 'user', 'dreamux.service');
+    const dispatcherCwd = join(root, 'workspace');
+    const workspaceSkillPath = dispatcherWorkspaceSkillPath(dispatcherCwd);
     mkdirSync(configDir, { recursive: true });
-    mkdirSync(runtimeDir, { recursive: true });
+    mkdirSync(stateRoot(), { recursive: true });
+    mkdirSync(logsRoot(), { recursive: true });
     mkdirSync(dirname(servicePath), { recursive: true });
+    mkdirSync(dirname(workspaceSkillPath), { recursive: true });
     writeFileSync(join(configDir, 'config.json'), JSON.stringify({
-      runtime_dir: runtimeDir,
-    }));
-    writeFileSync(join(runtimeDir, 'state.db'), '');
+      dispatchers: [
+        {
+          id: 'flow',
+          cwd: dispatcherCwd,
+          enabled: true,
+          feishu: {
+            app_id: 'app-test',
+            app_secret: 'secret-test',
+          },
+          codex: {
+            approval_policy: null,
+            sandbox_mode: null,
+            extra_args: [],
+          },
+        },
+      ],
+    }), { mode: 0o600 });
+    writeFileSync(join(logsRoot(), 'dreamux-server.log'), '');
+    writeFileSync(workspaceSkillPath, '# workspace skill\n');
     writeFileSync(servicePath, '[Service]\nExecStart=dreamux serve\n');
 
     const runner = new FakeRunner();
@@ -68,36 +97,76 @@ describe('dreamux uninstall', () => {
     });
 
     expect(existsSync(configDir)).toBe(false);
-    expect(existsSync(runtimeDir)).toBe(false);
+    expect(existsSync(stateRoot())).toBe(false);
+    expect(existsSync(logsRoot())).toBe(false);
     expect(existsSync(servicePath)).toBe(false);
-    expect(result.entries.map((entry) => [entry.status, entry.path])).toEqual([
-      ['removed', configDir],
-      ['removed', servicePath],
-      ['removed', runtimeDir],
-    ]);
+    expect(existsSync(workspaceSkillPath)).toBe(true);
+    expect(result.entries).toEqual(
+      expect.arrayContaining([
+        { status: 'removed', path: configDir, reason: 'dreamux config directory' },
+        { status: 'removed', path: servicePath, reason: 'systemd unit' },
+        { status: 'removed', path: stateRoot(), reason: 'dreamux state directory' },
+        { status: 'removed', path: logsRoot(), reason: 'dreamux logs directory' },
+        {
+          status: 'skipped',
+          path: workspaceSkillPath,
+          reason: 'workspace-local dispatcher skill (not removed)',
+        },
+      ]),
+    );
     expect(runner.calls.map((call) => [call.command, call.args])).toEqual([
       ['systemctl', ['--user', 'disable', '--now', 'dreamux.service']],
       ['systemctl', ['--user', 'daemon-reload']],
     ]);
   });
 
-  it('refuses to remove operator Codex or Claude state paths', async () => {
-    const runner = new FakeRunner();
+  it('unregisters launchd services and removes the plist', async () => {
     const configDir = join(root, 'config');
     const homeDir = join(root, 'home');
-    process.env['CODEX_HOME'] = join(root, 'operator-codex');
-    process.env['CLAUDE_CONFIG_DIR'] = join(root, 'operator-claude');
+    const servicePath = join(
+      homeDir,
+      'Library',
+      'LaunchAgents',
+      'dev.excited.dreamux.plist',
+    );
+    mkdirSync(configDir, { recursive: true });
+    mkdirSync(stateRoot(), { recursive: true });
+    mkdirSync(logsRoot(), { recursive: true });
+    mkdirSync(dirname(servicePath), { recursive: true });
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({}), {
+      mode: 0o600,
+    });
+    writeFileSync(servicePath, '<plist />\n');
 
-    for (const unsafeRuntimeDir of [
-      join(homedir(), '.codex'),
-      join(process.env['CODEX_HOME'], 'nested'),
-      join(homedir(), '.claude'),
-      process.env['CLAUDE_CONFIG_DIR'],
-    ]) {
+    const runner = new FakeRunner();
+    runner.launchdLoaded = true;
+    const result = await runUninstall({
+      configDir,
+      runner,
+      platform: 'darwin',
+      homeDir,
+      uid: 501,
+    });
+
+    expect(existsSync(servicePath)).toBe(false);
+    expect(result.entries).toEqual(
+      expect.arrayContaining([
+        { status: 'removed', path: servicePath, reason: 'launchd unit' },
+      ]),
+    );
+    expect(runner.calls.map((call) => [call.command, call.args])).toEqual([
+      ['launchctl', ['bootout', 'gui/501/dev.excited.dreamux']],
+    ]);
+  });
+
+  it('refuses to remove operator Codex or Claude state paths', async () => {
+    const runner = new FakeRunner();
+    const homeDir = join(root, 'home');
+
+    for (const unsafeConfigDir of [join(homedir(), '.codex'), join(homedir(), '.claude')]) {
       await expect(
         runUninstall({
-          configDir,
-          runtimeDir: unsafeRuntimeDir,
+          configDir: unsafeConfigDir,
           runner,
           platform: 'linux',
           homeDir,
@@ -108,7 +177,6 @@ describe('dreamux uninstall', () => {
     await expect(
       runUninstall({
         configDir: join(homedir(), '.claude'),
-        runtimeDir: join(root, 'runtime'),
         runner,
         platform: 'linux',
         homeDir,
@@ -117,38 +185,57 @@ describe('dreamux uninstall', () => {
     expect(runner.calls).toEqual([]);
   });
 
-  it('fails fast on legacy or invalid config instead of falling back to the default runtime', async () => {
+  it('warns on legacy, invalid, or non-owner-only config and still uninstalls', async () => {
     const cases: Array<{
       name: string;
       file: string;
       content: string;
-      error: RegExp;
+      warning: RegExp;
+      mode?: number;
     }> = [
       {
         name: 'legacy TOML only',
         file: 'config.toml',
-        content: 'runtime_dir = "/tmp/old-runtime"\n',
-        error: /legacy dreamux config/,
+        content: 'dispatchers = []\n',
+        warning: /legacy dreamux config/,
       },
       {
         name: 'invalid JSON syntax',
         file: 'config.json',
-        content: '{"runtime_dir": ',
-        error: /dreamux config parse error/,
+        content: '{"dispatchers": ',
+        warning: /dreamux config parse error/,
       },
       {
         name: 'invalid JSON value',
         file: 'config.json',
-        content: JSON.stringify({ runtime_dir: 42 }),
-        error: /runtime_dir must be a string/,
+        content: JSON.stringify({ dispatchers: 42 }),
+        warning: /dispatchers must be an array/,
+      },
+      {
+        name: 'world-readable JSON config',
+        file: 'config.json',
+        content: JSON.stringify({
+          dispatchers: [
+            {
+              id: 'flow',
+              feishu: {
+                app_id: 'app-test',
+                app_secret: 'secret-test',
+              },
+            },
+          ],
+        }),
+        warning: /must be mode 0600/,
+        mode: 0o644,
       },
     ];
 
     for (const testCase of cases) {
       const caseRoot = join(root, testCase.name.replaceAll(' ', '-'));
       const configDir = join(caseRoot, 'config');
-      const runtimeDir = join(caseRoot, 'runtime');
       const homeDir = join(caseRoot, 'home');
+      const previousCaseHome = process.env['HOME'];
+      process.env['HOME'] = homeDir;
       const servicePath = join(
         homeDir,
         '.config',
@@ -157,31 +244,43 @@ describe('dreamux uninstall', () => {
         'dreamux.service',
       );
       mkdirSync(configDir, { recursive: true });
-      mkdirSync(runtimeDir, { recursive: true });
+      mkdirSync(stateRoot(), { recursive: true });
+      mkdirSync(logsRoot(), { recursive: true });
       mkdirSync(dirname(servicePath), { recursive: true });
-      writeFileSync(join(configDir, testCase.file), testCase.content);
-      writeFileSync(join(runtimeDir, 'state.db'), '');
+      if (testCase.file === 'config.json') {
+        const configPath = join(configDir, testCase.file);
+        writeFileSync(configPath, testCase.content, {
+          mode: 0o600,
+        });
+        if (testCase.mode !== undefined) chmodSync(configPath, testCase.mode);
+      } else {
+        writeFileSync(join(configDir, testCase.file), testCase.content);
+      }
+      writeFileSync(join(logsRoot(), 'dreamux-server.log'), '');
       writeFileSync(servicePath, '[Service]\nExecStart=dreamux serve\n');
 
       const runner = new FakeRunner();
-      await expect(
-        runUninstall({
+      try {
+        const result = await runUninstall({
           configDir,
           runner,
           platform: 'linux',
           homeDir,
-        }),
-      ).rejects.toThrow(testCase.error);
+        });
 
-      expect(existsSync(configDir)).toBe(true);
-      expect(existsSync(runtimeDir)).toBe(true);
-      expect(existsSync(servicePath)).toBe(true);
-      expect(runner.calls).toEqual([]);
+        expect(result.warnings).toHaveLength(1);
+        expect(result.warnings[0]).toMatch(testCase.warning);
+        expect(existsSync(configDir)).toBe(false);
+        expect(existsSync(stateRoot())).toBe(false);
+        expect(existsSync(logsRoot())).toBe(false);
+        expect(existsSync(servicePath)).toBe(false);
+        expect(runner.calls.map((call) => [call.command, call.args])).toEqual([
+          ['systemctl', ['--user', 'disable', '--now', 'dreamux.service']],
+          ['systemctl', ['--user', 'daemon-reload']],
+        ]);
+      } finally {
+        process.env['HOME'] = previousCaseHome;
+      }
     }
   });
 });
-
-function restoreEnv(name: string, value: string | undefined): void {
-  if (value === undefined) delete process.env[name];
-  else process.env[name] = value;
-}

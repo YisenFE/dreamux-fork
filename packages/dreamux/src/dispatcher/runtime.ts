@@ -6,13 +6,11 @@
  *   - CodexWsClient (WS connection)
  *   - thread_id (lazily created via thread/start or resumed)
  *   - TurnManager (FIFO worker for this dispatcher)
- *   - approval handler bound to the current "source chat" for hints
  *
  * Lifecycle: declared → starting → ready → (degraded) → stopping → stopped.
  *
- * Issue #2 §"崩溃与异常恢复":
- *   - On startup, mark stale `running` rows as `unknown` before opening
- *     inbound — at-most-once.
+ * Current MVP:
+ *   - accepted inbound work is process-local and is dropped on restart;
  *   - thread/resume failure does not degrade the whole dispatcher; we
  *     start a fresh thread, record the lost one in last_lost_thread_id,
  *     and post a visible warning to the next source chat.
@@ -21,19 +19,23 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import type { DispatcherRow, DispatcherStatus } from '../db/types.js';
 import type {
-  DispatcherRepo,
-  InboundRepo,
-} from '../db/repository.js';
-import { CodexProcess, type CodexProcessOptions } from '../codex/supervisor.js';
+  DispatcherRow,
+  DispatcherStatus,
+  DispatcherStore,
+} from '../runtime/dispatcher-store.js';
+import {
+  CodexProcess,
+  type CodexProcessExit,
+  type CodexProcessOptions,
+} from '../codex/supervisor.js';
 import { CodexWsClient } from '../codex/rpc.js';
 import { performInitializeHandshake } from '../codex/handshake.js';
 import type {
   ThreadResumeResponse,
   ThreadStartResponse,
 } from '../codex/types.js';
-import { TurnManager } from './turn-manager.js';
+import { TurnManager, type InboundTurnInput } from './turn-manager.js';
 import { createFailFastApprovalHandler } from './approval.js';
 import {
   dispatcherCodexCwd,
@@ -45,12 +47,13 @@ import {
   dispatcherCodexHomeDoctorContext,
   type DispatcherCodexHomeDoctor,
 } from '../runtime/dispatcher-codex-home.js';
-import { outboundTargetForInbound, type OutboundSink } from '../channel/outbound.js';
+import { dispatcherProcessEnv } from '../runtime/package-bin.js';
+
+const DEFAULT_RESTART_BACKOFF_BASE_MS = 1000;
+const DEFAULT_RESTART_BACKOFF_MAX_MS = 30_000;
 
 export interface DispatcherRuntimeDeps {
-  dispatchers: DispatcherRepo;
-  inbound: InboundRepo;
-  outbound: OutboundSink;
+  dispatchers: DispatcherStore;
   /** Optional bin path override for tests. */
   codexBinPath?: string;
   /** Override process construction for tests. */
@@ -63,10 +66,12 @@ export interface DispatcherRuntimeDeps {
   resolveExtraArgs?: (row: DispatcherRow) => string[];
   /** Codex initialize handshake timeout (ms). From ~/.dreamux/config.json. */
   handshakeTimeoutMs?: number;
-  /** Outbound retry count. From ~/.dreamux/config.json. */
-  outboundRetries?: number;
-  /** Outbound retry delay (ms). From ~/.dreamux/config.json. */
-  outboundRetryDelayMs?: number;
+  /** Per-dispatcher environment overrides from config. */
+  extraEnv?: Record<string, string>;
+  /** Codex child/WS restart backoff base (tests may override). */
+  restartBackoffBaseMs?: number;
+  /** Codex child/WS restart backoff cap (tests may override). */
+  restartBackoffMaxMs?: number;
   log?: (level: 'info' | 'warn' | 'error', msg: string, err?: unknown) => void;
 }
 
@@ -75,9 +80,12 @@ export class DispatcherRuntime {
   private client: CodexWsClient | null = null;
   private turnManager: TurnManager | null = null;
   private threadId: string | null = null;
-  private currentInboundChatId: string | null = null;
   private status: DispatcherStatus = 'declared';
   private readonly log: NonNullable<DispatcherRuntimeDeps['log']>;
+  private stopping = false;
+  private restarting = false;
+  private restartAttempts = 0;
+  private restartTimer: NodeJS.Timeout | null = null;
 
   constructor(
     public readonly row: DispatcherRow,
@@ -99,126 +107,32 @@ export class DispatcherRuntime {
     return this.status;
   }
 
-  /** Called by Feishu inbound right before enqueuing into inbound_buffer. */
-  setCurrentInboundChat(chatId: string | null): void {
-    this.currentInboundChatId = chatId;
-  }
-
   getThreadId(): string | null {
     return this.threadId;
   }
 
   /**
    * Bring the dispatcher up. Order:
-   *  1. crash recovery sweep on inbound_buffer (running → unknown)
-   *  2. spawn codex app-server child
-   *  3. open WS client
-   *  4. install fail-fast approval handler
-   *  5. thread/start (new) or thread/resume (existing)
-   *  6. install turn manager + retry pending outbound
-   *  7. status = ready
+   *  1. spawn codex app-server child
+   *  2. open WS client
+   *  3. install fail-fast approval handler
+   *  4. thread/start (new) or thread/resume (existing)
+   *  5. install turn manager
+   *  6. status = ready
    */
   async start(): Promise<void> {
+    this.stopping = false;
+    this.restarting = false;
+    this.clearRestartTimer();
     this.setStatus('starting');
     this.deps.dispatchers.setStatus(this.dispatcherId, 'starting', {
       last_started_at: Date.now(),
     });
 
     try {
-      await this.recoverInboundOnStartup();
+      await this.startCodexRuntime();
+      this.markReady();
 
-      const cwd = this.row.codex_cwd ?? dispatcherCodexCwd(this.dispatcherId);
-      const socketPath = dispatcherSocketPath(this.dispatcherId);
-      const extraArgs = this.deps.resolveExtraArgs?.(this.row) ?? [];
-      if (this.deps.codexHomeDoctor !== undefined) {
-        await this.deps.codexHomeDoctor(
-          dispatcherCodexHomeDoctorContext(this.dispatcherId, {
-            codexCliArgs: extraArgs,
-          }),
-        );
-      }
-
-      const factory = this.deps.codexProcessFactory ?? ((o) => new CodexProcess(o));
-      this.process = factory({
-        socketPath,
-        cwd,
-        stdoutLogPath: dispatcherStdoutLog(this.dispatcherId),
-        stderrLogPath: dispatcherStderrLog(this.dispatcherId),
-        binPath: this.deps.codexBinPath,
-        extraArgs,
-        env: { ...process.env },
-      });
-      mkdirSync(dirname(socketPath), { recursive: true });
-      await this.process.start();
-
-      const clientFactory =
-        this.deps.codexClientFactory ?? ((sock) => new CodexWsClient({ socketPath: sock }));
-      this.client = clientFactory(socketPath);
-      await this.client.ready();
-
-      const approvalHandler = createFailFastApprovalHandler({
-        onReject: async (req) => {
-          // Best-effort hint to the user, only if we know who is asking.
-          const chatId = this.currentInboundChatId;
-          if (chatId === null) return;
-          try {
-            await this.deps.outbound.send(
-              { conversationId: chatId },
-              `Codex 请求了一次审批（${req.method}），但当前 dispatcher 不支持审批 —— 本轮将失败。`,
-            );
-          } catch {
-            /* nothing useful to do */
-          }
-        },
-      });
-      this.client.setServerRequestHandler(approvalHandler);
-
-      // codex 0.134+ LSP-style handshake — must precede thread/start or
-      // any other RPC, otherwise codex answers everything with
-      // `Not initialized` (see src/codex/handshake.ts).
-      const initResponse = await performInitializeHandshake(this.client, {
-        ...(this.deps.handshakeTimeoutMs !== undefined
-          ? { timeoutMs: this.deps.handshakeTimeoutMs }
-          : {}),
-      });
-      this.log(
-        'info',
-        `codex initialized: ${initResponse.userAgent} (home=${initResponse.codexHome}, ${initResponse.platformOs})`,
-      );
-
-      await this.resolveThread();
-
-      this.turnManager = new TurnManager({
-        dispatcherId: this.dispatcherId,
-        inbound: this.deps.inbound,
-        getThreadId: () => this.threadId,
-        client: this.client,
-        outbound: this.deps.outbound,
-        log: this.log,
-        ...(this.deps.outboundRetries !== undefined
-          ? { outboundRetries: this.deps.outboundRetries }
-          : {}),
-        ...(this.deps.outboundRetryDelayMs !== undefined
-          ? { outboundRetryDelayMs: this.deps.outboundRetryDelayMs }
-          : {}),
-      });
-      await this.turnManager.retryPendingOutbound();
-
-      this.setStatus('ready');
-      this.deps.dispatchers.setStatus(this.dispatcherId, 'ready', {
-        last_ready_at: Date.now(),
-        last_error: null,
-      });
-
-      // Issue #2 + PR #3 review #1: the durable inbound buffer's contract
-      // says nothing is dropped across a server crash. retryPendingOutbound
-      // covers awaiting_outbound / outbound_failed rows; recoverInboundOnStartup
-      // covers running → unknown. But rows persisted in 'queued' before the
-      // crash are only drained when notify() is invoked, and at startup no
-      // new inbound has arrived yet. Kick the worker once so any
-      // already-queued backlog drains immediately instead of stalling until
-      // the next live message lands.
-      this.turnManager.notify();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log('error', `start failed: ${msg}`, err);
@@ -231,9 +145,83 @@ export class DispatcherRuntime {
     }
   }
 
+  private async startCodexRuntime(): Promise<void> {
+    const cwd = this.row.codex_cwd ?? dispatcherCodexCwd(this.dispatcherId);
+    const socketPath = dispatcherSocketPath(this.dispatcherId);
+    const extraArgs = this.deps.resolveExtraArgs?.(this.row) ?? [];
+    if (this.deps.codexHomeDoctor !== undefined) {
+      await this.deps.codexHomeDoctor(
+        dispatcherCodexHomeDoctorContext(this.dispatcherId, {
+          codexCliArgs: extraArgs,
+          dispatcherCwd: cwd,
+        }),
+      );
+    }
+
+    const factory = this.deps.codexProcessFactory ?? ((o) => new CodexProcess(o));
+    const process = factory({
+      socketPath,
+      cwd,
+      stdoutLogPath: dispatcherStdoutLog(this.dispatcherId),
+      stderrLogPath: dispatcherStderrLog(this.dispatcherId),
+      binPath: this.deps.codexBinPath,
+      extraArgs,
+      env: dispatcherProcessEnv(globalThis.process.env, this.deps.extraEnv ?? {}),
+    });
+    this.process = process;
+    process.onExit((exit) => {
+      if (this.process !== process) return;
+      this.handleChildExit(exit);
+    });
+    mkdirSync(dirname(socketPath), { recursive: true });
+    await process.start();
+
+    const clientFactory =
+      this.deps.codexClientFactory ?? ((sock) => new CodexWsClient({ socketPath: sock }));
+    const client = clientFactory(socketPath);
+    this.client = client;
+    client.onClose((reason) => {
+      if (this.client !== client) return;
+      this.handleClientClose(reason);
+    });
+    await client.ready();
+
+    const approvalHandler = createFailFastApprovalHandler({
+      onReject: async (req) => {
+        this.log(
+          'warn',
+          `rejected Codex approval request '${req.method}'; Feishu outbound is MCP reply-only`,
+        );
+      },
+    });
+    this.client.setServerRequestHandler(approvalHandler);
+
+    // codex 0.134+ LSP-style handshake — must precede thread/start or
+    // any other RPC, otherwise codex answers everything with
+    // `Not initialized` (see src/codex/handshake.ts).
+    const initResponse = await performInitializeHandshake(this.client, {
+      ...(this.deps.handshakeTimeoutMs !== undefined
+        ? { timeoutMs: this.deps.handshakeTimeoutMs }
+        : {}),
+    });
+    this.log(
+      'info',
+      `codex initialized: ${initResponse.userAgent} (home=${initResponse.codexHome}, ${initResponse.platformOs})`,
+    );
+
+    await this.resolveThread();
+
+    this.turnManager = new TurnManager({
+      dispatcherId: this.dispatcherId,
+      getThreadId: () => this.threadId,
+      client: this.client,
+      log: this.log,
+    });
+  }
+
   private async resolveThread(): Promise<void> {
     if (this.client === null) throw new Error('client not initialized');
-    const existing = this.row.thread_id;
+    const existing = this.threadId ?? this.row.thread_id;
     if (existing === null) {
       // Fresh thread.
       const res = await this.client.request<ThreadStartResponse>(
@@ -276,78 +264,143 @@ export class DispatcherRuntime {
   }
 
   /**
-   * Drain any inbound message arriving for this dispatcher. Called by the
-   * Feishu inbound layer. Returns the assigned inbound row id, or null if
-   * the message was a duplicate.
+   * Queue any accepted inbound message arriving for this dispatcher. Called by
+   * the Feishu inbound layer. Returns false if this process already saw the
+   * message_id.
    */
-  enqueueInbound(input: {
-    source_chat_id: string;
-    source_message_id: string | null;
-    sender_id: string | null;
-    feishu_event_json: string;
-    parsed_text: string;
-  }): number | null {
-    const row = this.deps.inbound.enqueue({
-      dispatcher_id: this.dispatcherId,
-      ...input,
-    });
-    if (row === null) return null;
-    this.setCurrentInboundChat(input.source_chat_id);
-    this.turnManager?.notify();
-    return row.id;
-  }
-
-  private async recoverInboundOnStartup(): Promise<void> {
-    const stale = this.deps.inbound.markRunningAsUnknown(this.dispatcherId);
-    for (const row of stale) {
-      this.log(
-        'warn',
-        `inbound ${row.id} was 'running' at restart — marked unknown (at-most-once); chat=${row.source_chat_id}`,
-      );
-      try {
-        await this.deps.outbound.send(
-          outboundTargetForInbound(row),
-          `上一次的执行结果未知（server 重启时正在进行）。请确认是否需要重新发送：\n> ${row.parsed_text.slice(0, 200)}`,
-        );
-      } catch (err) {
-        this.log('warn', `failed to notify chat about unknown inbound`, err);
-      }
-    }
+  enqueueInbound(input: InboundTurnInput): boolean {
+    if (this.turnManager === null) return false;
+    return this.turnManager.enqueue(input);
   }
 
   /** Graceful stop: stop accepting work, reap codex child. */
   async stop(): Promise<void> {
+    this.stopping = true;
+    this.clearRestartTimer();
     this.setStatus('stopping');
     this.deps.dispatchers.setStatus(this.dispatcherId, 'stopping');
-    if (this.turnManager !== null) await this.turnManager.stop();
-    if (this.client !== null) {
-      try {
-        this.client.close();
-      } catch {
-        /* best effort */
-      }
-    }
-    if (this.process !== null) {
-      await this.process.reap();
-    }
+    await this.teardownCodexRuntime();
     this.setStatus('stopped');
     this.deps.dispatchers.setStatus(this.dispatcherId, 'stopped');
   }
 
   private async cleanupOnFailure(): Promise<void> {
-    if (this.client !== null) {
+    this.clearRestartTimer();
+    const wasStopping = this.stopping;
+    this.stopping = true;
+    try {
+      await this.teardownCodexRuntime();
+    } finally {
+      this.stopping = wasStopping;
+    }
+  }
+
+  private async teardownCodexRuntime(): Promise<void> {
+    const turnManager = this.turnManager;
+    this.turnManager = null;
+    if (turnManager !== null) await turnManager.stop();
+
+    const client = this.client;
+    this.client = null;
+    if (client !== null) {
       try {
-        this.client.close();
+        client.close();
       } catch {
         /* */
       }
-      this.client = null;
     }
-    if (this.process !== null) {
-      await this.process.reap();
-      this.process = null;
+
+    const process = this.process;
+    this.process = null;
+    if (process !== null) {
+      await process.reap();
     }
-    this.turnManager = null;
+  }
+
+  private handleChildExit(exit: CodexProcessExit): void {
+    const details =
+      exit.signal !== null ? `signal=${exit.signal}` : `code=${exit.code ?? 'null'}`;
+    this.scheduleRestart(`codex app-server child exited (${details})`);
+  }
+
+  private handleClientClose(reason: Error): void {
+    this.scheduleRestart(`codex app-server websocket closed: ${reason.message}`);
+  }
+
+  private scheduleRestart(reason: string): void {
+    if (this.stopping || this.restartTimer !== null || this.restarting) return;
+    const attempt = this.restartAttempts + 1;
+    this.restartAttempts = attempt;
+    const delay = this.restartDelayMs(attempt);
+    this.log('warn', `${reason}; restarting in ${delay}ms`);
+    this.setStatus('degraded');
+    this.deps.dispatchers.setStatus(this.dispatcherId, 'degraded', {
+      last_error: reason,
+    });
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.restartCodexRuntime(reason);
+    }, delay);
+  }
+
+  private async restartCodexRuntime(reason: string): Promise<void> {
+    if (this.stopping) return;
+    this.restarting = true;
+    let retryReason: string | null = null;
+    this.setStatus('starting');
+    this.deps.dispatchers.setStatus(this.dispatcherId, 'starting', {
+      last_started_at: Date.now(),
+    });
+    try {
+      await this.teardownCodexRuntime();
+      if (this.stopping) return;
+      await this.startCodexRuntime();
+      if (this.stopping) {
+        await this.teardownCodexRuntime();
+        return;
+      }
+      this.restartAttempts = 0;
+      this.markReady();
+      this.log('info', `restarted codex app-server after: ${reason}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log('error', `restart failed: ${msg}`, err);
+      this.setStatus('degraded');
+      this.deps.dispatchers.setStatus(this.dispatcherId, 'degraded', {
+        last_error: msg,
+      });
+      await this.teardownCodexRuntime();
+      retryReason = `codex app-server restart failed: ${msg}`;
+    } finally {
+      this.restarting = false;
+    }
+    if (retryReason !== null) this.scheduleRestart(retryReason);
+  }
+
+  private restartDelayMs(attempt: number): number {
+    const base = Math.max(
+      0,
+      this.deps.restartBackoffBaseMs ?? DEFAULT_RESTART_BACKOFF_BASE_MS,
+    );
+    const max = Math.max(
+      base,
+      this.deps.restartBackoffMaxMs ?? DEFAULT_RESTART_BACKOFF_MAX_MS,
+    );
+    return Math.min(max, base * 2 ** Math.max(0, attempt - 1));
+  }
+
+  private clearRestartTimer(): void {
+    if (this.restartTimer === null) return;
+    clearTimeout(this.restartTimer);
+    this.restartTimer = null;
+  }
+
+  private markReady(): void {
+    this.setStatus('ready');
+    this.deps.dispatchers.setStatus(this.dispatcherId, 'ready', {
+      last_ready_at: Date.now(),
+      last_error: null,
+    });
   }
 
   private setStatus(s: DispatcherStatus): void {

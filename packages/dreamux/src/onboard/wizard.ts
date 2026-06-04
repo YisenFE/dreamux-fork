@@ -11,6 +11,7 @@ import {
 } from '@clack/prompts';
 
 import { expandHome } from '../runtime/config.js';
+import { validateDispatcherId } from '../runtime/dispatcher-id.js';
 import type { OnboardAnswers } from './types.js';
 
 export interface OnboardCliOptions {
@@ -21,16 +22,6 @@ export interface OnboardCliOptions {
   dispatcherId?: string;
   dispatcherCwd?: string;
   codexBin?: string;
-  codexMarketplaceSource?: string;
-  codexMarketplaceSparse?: string | string[];
-  codexMarketplaceName?: string;
-  codexPluginRef?: string;
-  claudeBin?: string;
-  claudeConfigDir?: string;
-  claudeMarketplaceSource?: string;
-  claudeMarketplaceSparse?: string | string[];
-  claudeMarketplaceName?: string;
-  claudePluginRef?: string;
   botAppId?: string;
   botAppSecret?: string;
   registerService?: boolean;
@@ -39,16 +30,6 @@ export interface OnboardCliOptions {
 }
 
 const DEFAULT_DISPATCHER_ID = 'dispatcher';
-const DEFAULT_CODEX_MARKETPLACE_SOURCE = 'excitedjs/dreamux';
-const DEFAULT_CODEX_MARKETPLACE_SPARSE = [
-  '.agents/plugins',
-  'codex-marketplace/plugins/codexmux',
-];
-const DEFAULT_CODEX_MARKETPLACE_NAME = 'dreamux';
-const DEFAULT_CODEX_PLUGIN_REF = 'codexmux@dreamux';
-const DEFAULT_CLAUDE_MARKETPLACE_SOURCE = 'excitedjs/claudemux';
-const DEFAULT_CLAUDE_MARKETPLACE_NAME = 'claudemux';
-const DEFAULT_CLAUDE_PLUGIN_REF = 'claudemux@claudemux';
 
 export async function collectOnboardAnswers(
   options: OnboardCliOptions,
@@ -122,31 +103,11 @@ export function answersFromOptions(
   return {
     configDir: normalizePath(options.configDir ?? defaultConfigDir(options)),
     runtimeDir: normalizePath(options.runtimeDir ?? defaultRuntimeDir(options)),
-    dispatcherId: options.dispatcherId ?? DEFAULT_DISPATCHER_ID,
+    dispatcherId: validateDispatcherId(
+      options.dispatcherId ?? DEFAULT_DISPATCHER_ID,
+    ),
     dispatcherCwd: normalizePath(dispatcherCwd),
     codexBin: options.codexBin ?? 'codex',
-    codexMarketplaceSource:
-      options.codexMarketplaceSource ?? DEFAULT_CODEX_MARKETPLACE_SOURCE,
-    codexMarketplaceSparse: normalizeStringArray(
-      options.codexMarketplaceSparse,
-      DEFAULT_CODEX_MARKETPLACE_SPARSE,
-    ),
-    codexMarketplaceName:
-      options.codexMarketplaceName ?? DEFAULT_CODEX_MARKETPLACE_NAME,
-    codexPluginRef: options.codexPluginRef ?? DEFAULT_CODEX_PLUGIN_REF,
-    claudeBin: options.claudeBin ?? 'claude',
-    claudeConfigDir: normalizePath(
-      options.claudeConfigDir ?? join(homedir(), '.claude'),
-    ),
-    claudeMarketplaceSource:
-      options.claudeMarketplaceSource ?? DEFAULT_CLAUDE_MARKETPLACE_SOURCE,
-    claudeMarketplaceSparse: normalizeStringArray(
-      options.claudeMarketplaceSparse,
-      [],
-    ),
-    claudeMarketplaceName:
-      options.claudeMarketplaceName ?? DEFAULT_CLAUDE_MARKETPLACE_NAME,
-    claudePluginRef: options.claudePluginRef ?? DEFAULT_CLAUDE_PLUGIN_REF,
     botAppId,
     botAppSecret,
     registerService: options.registerService ?? true,
@@ -163,7 +124,7 @@ function defaultConfigDir(options: OnboardCliOptions): string {
 }
 
 function defaultRuntimeDir(options: OnboardCliOptions): string {
-  return options.runtimeDir ?? join(homedir(), '.codex-host');
+  return options.runtimeDir ?? join(homedir(), '.dreamux', 'runtime');
 }
 
 async function promptText(label: string, initialValue?: string): Promise<string> {
@@ -207,12 +168,4 @@ function requiredOption(
 
 function normalizePath(path: string): string {
   return resolve(expandHome(path));
-}
-
-function normalizeStringArray(
-  value: string | string[] | undefined,
-  fallback: string[],
-): string[] {
-  if (value === undefined) return fallback;
-  return (Array.isArray(value) ? value : [value]).filter((item) => item !== '');
 }

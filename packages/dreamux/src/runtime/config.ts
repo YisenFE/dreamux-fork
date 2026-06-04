@@ -2,8 +2,7 @@
  * Global dreamux configuration loaded from `~/.dreamux/config.json`.
  *
  * Layout:
- *   ~/.dreamux/        user-editable dreamux configuration and channel secrets
- *   ~/.codex-host/     runtime data (SQLite, sockets, dispatcher logs)
+ *   ~/.dreamux/config.json  dreamux configuration and local channel secrets
  *
  * Format: JSON. dreamux does not write TOML files.
  */
@@ -16,14 +15,12 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  statSync,
   writeSync,
 } from 'node:fs';
+import { validateDispatcherId } from './dispatcher-id.js';
 
 export interface DreamuxConfig {
-  /** Where dreamux stores runtime state. */
-  runtime_dir: string;
-  /** Admin Unix socket path; null = derive as <runtime_dir>/admin.sock. */
-  admin_socket: string | null;
   codex: {
     /** codex CLI binary path; `codex` resolves via $PATH. */
     bin: string;
@@ -36,25 +33,29 @@ export interface DreamuxConfig {
     /** Handshake timeout (ms). */
     initialize_timeout_ms: number;
   };
-  outbound: {
-    /** Outbound (Feishu send) retry count. */
-    retries: number;
-    /** Initial outbound retry delay (ms). */
-    retry_delay_ms: number;
-  };
-  feishu: {
-    bots: Record<string, FeishuBotConfig>;
-  };
+  /** Dispatcher declarations and local channel credentials. */
+  dispatchers: DispatcherConfig[];
 }
 
-export interface FeishuBotConfig {
-  app_id: string;
-  app_secret: string;
+export interface DispatcherConfig {
+  id: string;
+  cwd: string | null;
+  enabled: boolean;
+  feishu: {
+    app_id: string;
+    app_secret: string;
+  };
+  codex: DispatcherCodexConfig;
+}
+
+export interface DispatcherCodexConfig {
+  approval_policy: string | null;
+  sandbox_mode: string | null;
+  extra_args: string[];
+  extra_env: Record<string, string>;
 }
 
 export const BUILT_IN_DEFAULTS: DreamuxConfig = {
-  runtime_dir: '~/.codex-host',
-  admin_socket: null,
   codex: {
     bin: 'codex',
     approval_policy: 'never',
@@ -62,13 +63,7 @@ export const BUILT_IN_DEFAULTS: DreamuxConfig = {
     extra_args: [],
     initialize_timeout_ms: 10_000,
   },
-  outbound: {
-    retries: 3,
-    retry_delay_ms: 1000,
-  },
-  feishu: {
-    bots: {},
-  },
+  dispatchers: [],
 };
 
 export const ALLOWED_SANDBOX_MODES = new Set([
@@ -131,7 +126,7 @@ export function redactConfigForDisplay(raw: string, file: string): string {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(
       `dreamux config parse error in ${file}: ${msg}\n` +
-        `Use 'dreamux config show --raw' to print the file without redaction.`,
+        'Fix the JSON syntax before running `dreamux config show`.',
     );
   }
   redactFeishuSecrets(parsed);
@@ -139,6 +134,13 @@ export function redactConfigForDisplay(raw: string, file: string): string {
 }
 
 function readConfigFile(file: string): DreamuxConfig {
+  if (!existsSync(file)) {
+    throw new Error(
+      `dreamux config is missing at ${file}.\n` +
+        'Run `dreamux onboard` to create it before starting the server.',
+    );
+  }
+  assertConfigFileMode(file);
   const raw = readFileSync(file, 'utf8');
   let parsed: unknown;
   try {
@@ -147,7 +149,7 @@ function readConfigFile(file: string): DreamuxConfig {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(
       `dreamux config parse error in ${file}: ${msg}\n` +
-        `Fix the JSON syntax in ${file} and restart, or delete the file to regenerate defaults.`,
+        `Fix the JSON syntax in ${file}, then restart. Run \`dreamux onboard\` if you need to recreate the config.`,
     );
   }
   return mergeWithDefaults(parsed, file);
@@ -161,8 +163,8 @@ export function assertNoLegacyTomlOnly(
   if (existsSync(jsonFile) || !existsSync(tomlFile)) return;
   throw new Error(
     `legacy dreamux config detected at ${tomlFile}, but ${jsonFile} does not exist.\n` +
-      'dreamux no longer reads TOML config and will not create default JSON over an existing install, because that can hide the old runtime_dir and dispatcher database.\n' +
-      `Create ${jsonFile} manually from ${tomlFile}, then move ${tomlFile} aside. Preserve runtime_dir/admin_socket/codex/outbound settings and add feishu.bots entries for configured dispatchers.`,
+      'dreamux no longer reads TOML config and will not create default JSON over an existing install.\n' +
+      `Create ${jsonFile} manually with a dispatchers array, then move ${tomlFile} aside.`,
   );
 }
 
@@ -182,23 +184,34 @@ function atomicWriteIfAbsent(file: string, content: string): boolean {
   return true;
 }
 
+export function assertConfigFileMode(file: string): void {
+  if (process.platform === 'win32') return;
+  const mode = statSync(file).mode & 0o777;
+  if (mode === 0o600) return;
+  throw new Error(
+    `dreamux config file must be mode 0600: ${file} has mode 0${mode.toString(8)}`,
+  );
+}
+
 function mergeWithDefaults(raw: unknown, file: string): DreamuxConfig {
   if (!isPlainObject(raw)) {
     throw new Error(`dreamux config error in ${file}: top-level must be an object`);
   }
+  rejectUnknownKeys(raw, new Set(['codex', 'dispatchers']), file, '');
 
   const codexIn = isPlainObject(raw['codex']) ? raw['codex'] : {};
-  const outboundIn = isPlainObject(raw['outbound']) ? raw['outbound'] : {};
-  const feishuIn = isPlainObject(raw['feishu']) ? raw['feishu'] : {};
-
-  const runtime_dir = expandHome(
-    requireString(raw, 'runtime_dir', BUILT_IN_DEFAULTS.runtime_dir, file),
+  rejectUnknownKeys(
+    codexIn,
+    new Set([
+      'bin',
+      'approval_policy',
+      'sandbox_mode',
+      'extra_args',
+      'initialize_timeout_ms',
+    ]),
+    file,
+    'codex.',
   );
-  const admin_socket_raw = raw['admin_socket'];
-  const admin_socket =
-    admin_socket_raw === undefined || admin_socket_raw === null
-      ? null
-      : expandHome(ensureString(admin_socket_raw, 'admin_socket', file));
 
   const approval_policy = requireString(
     codexIn,
@@ -235,8 +248,6 @@ function mergeWithDefaults(raw: unknown, file: string): DreamuxConfig {
   }
 
   return {
-    runtime_dir,
-    admin_socket,
     codex: {
       bin: requireString(codexIn, 'bin', BUILT_IN_DEFAULTS.codex.bin, file, 'codex.'),
       approval_policy,
@@ -256,58 +267,143 @@ function mergeWithDefaults(raw: unknown, file: string): DreamuxConfig {
         'codex.',
       ),
     },
-    outbound: {
-      retries: requireNonNegativeInt(
-        outboundIn,
-        'retries',
-        BUILT_IN_DEFAULTS.outbound.retries,
-        file,
-        'outbound.',
-      ),
-      retry_delay_ms: requireNonNegativeInt(
-        outboundIn,
-        'retry_delay_ms',
-        BUILT_IN_DEFAULTS.outbound.retry_delay_ms,
-        file,
-        'outbound.',
-      ),
-    },
-    feishu: {
-      bots: readFeishuBots(feishuIn, file),
-    },
+    dispatchers: readDispatchers(raw['dispatchers'], file),
   };
 }
 
-function readFeishuBots(
-  feishuIn: Record<string, unknown>,
-  file: string,
-): Record<string, FeishuBotConfig> {
-  const rawBots = feishuIn['bots'];
-  if (rawBots === undefined) return {};
-  if (!isPlainObject(rawBots)) {
+function readDispatchers(rawDispatchers: unknown, file: string): DispatcherConfig[] {
+  if (rawDispatchers === undefined) return [];
+  if (!Array.isArray(rawDispatchers)) {
     throw new Error(
-      `dreamux config error in ${file}: feishu.bots must be an object (got ${describeType(rawBots)})`,
+      `dreamux config error in ${file}: dispatchers must be an array (got ${describeType(rawDispatchers)})`,
     );
   }
-  const bots: Record<string, FeishuBotConfig> = {};
-  for (const [id, rawBot] of Object.entries(rawBots)) {
-    if (!isPlainObject(rawBot)) {
+  const out: DispatcherConfig[] = [];
+  const ids = new Set<string>();
+  const appIdToDispatcher = new Map<string, string>();
+  for (let index = 0; index < rawDispatchers.length; index++) {
+    const raw = rawDispatchers[index];
+    const prefix = `dispatchers[${index}].`;
+    if (!isPlainObject(raw)) {
       throw new Error(
-        `dreamux config error in ${file}: feishu.bots.${id} must be an object (got ${describeType(rawBot)})`,
+        `dreamux config error in ${file}: dispatchers[${index}] must be an object (got ${describeType(raw)})`,
       );
     }
-    bots[id] = {
-      app_id: requireString(rawBot, 'app_id', '', file, `feishu.bots.${id}.`),
-      app_secret: requireString(
-        rawBot,
-        'app_secret',
-        '',
-        file,
-        `feishu.bots.${id}.`,
-      ),
+    rejectUnknownKeys(
+      raw,
+      new Set(['id', 'cwd', 'enabled', 'feishu', 'codex']),
+      file,
+      prefix,
+    );
+    const id = validateDispatcherId(
+      requireNonEmptyString(raw, 'id', file, prefix),
+      `${prefix}id`,
+    );
+    if (ids.has(id)) {
+      throw new Error(
+        `dreamux config error in ${file}: dispatchers[${index}].id duplicates dispatcher '${id}'`,
+      );
+    }
+    ids.add(id);
+
+    const feishu = readDispatcherFeishu(raw['feishu'], file, prefix);
+    const app_id = feishu.app_id;
+    const existing = appIdToDispatcher.get(app_id);
+    if (existing !== undefined) {
+      throw new Error(
+        `dreamux config error in ${file}: dispatchers[${index}].feishu.app_id duplicates dispatcher '${existing}'`,
+      );
+    }
+    appIdToDispatcher.set(app_id, id);
+
+    const cwd = readOptionalString(raw, 'cwd', file, prefix);
+    out.push({
+      id,
+      cwd: cwd === null ? null : expandHome(cwd),
+      enabled: readOptionalBoolean(raw, 'enabled', true, file, prefix),
+      feishu,
+      codex: readDispatcherCodex(raw['codex'], file, prefix),
+    });
+  }
+  return out;
+}
+
+function readDispatcherFeishu(
+  rawFeishu: unknown,
+  file: string,
+  dispatcherPrefix: string,
+): DispatcherConfig['feishu'] {
+  const prefix = `${dispatcherPrefix}feishu.`;
+  if (!isPlainObject(rawFeishu)) {
+    throw new Error(
+      `dreamux config error in ${file}: ${dispatcherPrefix}feishu must be an object (got ${describeType(rawFeishu)})`,
+    );
+  }
+  rejectUnknownKeys(rawFeishu, new Set(['app_id', 'app_secret']), file, prefix);
+  return {
+    app_id: requireNonEmptyString(rawFeishu, 'app_id', file, prefix),
+    app_secret: requireNonEmptyString(rawFeishu, 'app_secret', file, prefix),
+  };
+}
+
+function readDispatcherCodex(
+  rawCodex: unknown,
+  file: string,
+  dispatcherPrefix: string,
+): DispatcherCodexConfig {
+  const prefix = `${dispatcherPrefix}codex.`;
+  if (rawCodex === undefined) {
+    return {
+      approval_policy: null,
+      sandbox_mode: null,
+      extra_args: [],
+      extra_env: {},
     };
   }
-  return bots;
+  if (!isPlainObject(rawCodex)) {
+    throw new Error(
+      `dreamux config error in ${file}: ${dispatcherPrefix}codex must be an object (got ${describeType(rawCodex)})`,
+    );
+  }
+  rejectUnknownKeys(
+    rawCodex,
+    new Set(['approval_policy', 'sandbox_mode', 'extra_args', 'extra_env']),
+    file,
+    prefix,
+  );
+  const approvalPolicy = readOptionalString(rawCodex, 'approval_policy', file, prefix);
+  if (approvalPolicy !== null && !new Set(['never', 'auto', 'auto-approve', 'on-failure']).has(approvalPolicy)) {
+    throw new Error(
+      `dreamux config error in ${file}: ${prefix}approval_policy='${approvalPolicy}' is not one of never | auto | auto-approve | on-failure`,
+    );
+  }
+  const sandboxMode = readOptionalString(rawCodex, 'sandbox_mode', file, prefix);
+  if (sandboxMode !== null && !ALLOWED_SANDBOX_MODES.has(sandboxMode)) {
+    throw new Error(
+      `dreamux config error in ${file}: ${prefix}sandbox_mode='${sandboxMode}' is not one of ${Array.from(ALLOWED_SANDBOX_MODES).join(' | ')}`,
+    );
+  }
+  return {
+    approval_policy: approvalPolicy,
+    sandbox_mode: sandboxMode,
+    extra_args: requireStringArray(rawCodex, 'extra_args', [], file, prefix),
+    extra_env: requireStringRecord(rawCodex, 'extra_env', {}, file, prefix),
+  };
+}
+
+function rejectUnknownKeys(
+  obj: Record<string, unknown>,
+  allowed: Set<string>,
+  file: string,
+  prefix: string,
+): void {
+  for (const key of Object.keys(obj)) {
+    if (allowed.has(key)) continue;
+    const name = `${prefix}${key}`;
+    throw new Error(
+      `dreamux config error in ${file}: ${name} is not supported by the MVP config schema`,
+    );
+  }
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -324,6 +420,45 @@ function requireString(
   const v = obj[key];
   if (v === undefined) return fallback;
   return ensureString(v, `${prefix}${key}`, file);
+}
+
+function requireNonEmptyString(
+  obj: Record<string, unknown>,
+  key: string,
+  file: string,
+  prefix = '',
+): string {
+  const value = requireString(obj, key, '', file, prefix);
+  if (value.trim() !== '') return value;
+  throw new Error(
+    `dreamux config error in ${file}: ${prefix}${key} must be a non-empty string`,
+  );
+}
+
+function readOptionalString(
+  obj: Record<string, unknown>,
+  key: string,
+  file: string,
+  prefix = '',
+): string | null {
+  const v = obj[key];
+  if (v === undefined || v === null) return null;
+  return ensureString(v, `${prefix}${key}`, file);
+}
+
+function readOptionalBoolean(
+  obj: Record<string, unknown>,
+  key: string,
+  fallback: boolean,
+  file: string,
+  prefix = '',
+): boolean {
+  const v = obj[key];
+  if (v === undefined) return fallback;
+  if (typeof v === 'boolean') return v;
+  throw new Error(
+    `dreamux config error in ${file}: ${prefix}${key} must be a boolean (got ${describeType(v)})`,
+  );
 }
 
 function ensureString(v: unknown, key: string, file: string): string {
@@ -359,6 +494,32 @@ function requireStringArray(
   });
 }
 
+function requireStringRecord(
+  obj: Record<string, unknown>,
+  key: string,
+  fallback: Record<string, string>,
+  file: string,
+  prefix = '',
+): Record<string, string> {
+  const v = obj[key];
+  if (v === undefined) return { ...fallback };
+  if (!isPlainObject(v)) {
+    throw new Error(
+      `dreamux config error in ${file}: ${prefix}${key} must be an object of strings (got ${describeType(v)})`,
+    );
+  }
+  const out: Record<string, string> = {};
+  for (const [entryKey, entryValue] of Object.entries(v)) {
+    if (typeof entryValue !== 'string') {
+      throw new Error(
+        `dreamux config error in ${file}: ${prefix}${key}.${entryKey} must be a string (got ${describeType(entryValue)})`,
+      );
+    }
+    out[entryKey] = entryValue;
+  }
+  return out;
+}
+
 function requirePositiveInt(
   obj: Record<string, unknown>,
   key: string,
@@ -371,23 +532,6 @@ function requirePositiveInt(
   if (n <= 0) {
     throw new Error(
       `dreamux config error in ${file}: ${prefix}${key} must be > 0 (got ${n})`,
-    );
-  }
-  return n;
-}
-
-function requireNonNegativeInt(
-  obj: Record<string, unknown>,
-  key: string,
-  fallback: number,
-  file: string,
-  prefix = '',
-): number {
-  const n = readInt(obj, key, file, prefix);
-  if (n === null) return fallback;
-  if (n < 0) {
-    throw new Error(
-      `dreamux config error in ${file}: ${prefix}${key} must be >= 0 (got ${n})`,
     );
   }
   return n;
@@ -414,15 +558,17 @@ function describeType(v: unknown): string {
 }
 
 function redactFeishuSecrets(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const item of value) redactFeishuSecrets(item);
+    return;
+  }
   if (!isPlainObject(value)) return;
-  const feishu = value['feishu'];
-  if (!isPlainObject(feishu)) return;
-  const bots = feishu['bots'];
-  if (!isPlainObject(bots)) return;
-  for (const bot of Object.values(bots)) {
-    if (isPlainObject(bot) && typeof bot['app_secret'] === 'string') {
-      bot['app_secret'] = '<redacted>';
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'app_secret' && typeof child === 'string') {
+      value[key] = '<redacted>';
+      continue;
     }
+    redactFeishuSecrets(child);
   }
 }
 

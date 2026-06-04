@@ -15,9 +15,11 @@ import yargs, { type Argv } from 'yargs';
 import { hideBin } from 'yargs/helpers';
 
 import {
+  assertConfigFileMode,
   globalConfigFile,
   redactConfigForDisplay,
 } from '../runtime/config.js';
+import { validateDispatcherId } from '../runtime/dispatcher-id.js';
 import { runOnboard } from '../onboard/run.js';
 import {
   runUninstall,
@@ -29,6 +31,7 @@ import {
 } from '../onboard/wizard.js';
 import type { OnboardRunResult } from '../onboard/types.js';
 import { printDoctorResult, runDreamuxDoctor } from './doctor.js';
+import { runFeishuMcp } from '../mcp/feishu-mcp.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SERVER_ENTRY = join(HERE, 'server.js');
@@ -65,6 +68,10 @@ function adminEnv(): NodeJS.ProcessEnv {
 function requiredString(value: unknown, name: string): string {
   if (typeof value === 'string' && value.trim() !== '') return value;
   throw new Error(`missing required option --${name}`);
+}
+
+function requiredDispatcherId(value: unknown): string {
+  return validateDispatcherId(requiredString(value, 'id'));
 }
 
 function optionalString(value: unknown): string | null {
@@ -121,7 +128,7 @@ function buildDispatcherCommands(y: Argv): Argv {
           'dispatcher',
           'add',
           '--id',
-          requiredString(argv.id, 'id'),
+          requiredDispatcherId(argv.id),
           '--bot-app-id',
           requiredString(argv.botAppId, 'bot-app-id'),
           '--bot-secret-ref',
@@ -144,7 +151,7 @@ function buildDispatcherCommands(y: Argv): Argv {
         const verb = requiredString(argv._[1], 'dispatcher verb') as DispatcherVerb;
         await execEntry(
           SERVER_CTL_ENTRY,
-          ['dispatcher', verb, '--id', requiredString(argv.id, 'id')],
+          ['dispatcher', verb, '--id', requiredDispatcherId(argv.id)],
           adminEnv(),
         );
       },
@@ -182,48 +189,6 @@ function buildOnboardCommand(y: Argv): Argv {
     .option('codex-bin', {
       type: 'string',
       describe: 'Codex CLI binary or absolute path',
-    })
-    .option('codex-marketplace-source', {
-      type: 'string',
-      describe: 'Codex plugin marketplace source',
-    })
-    .option('codex-marketplace-sparse', {
-      type: 'array',
-      string: true,
-      describe: 'Sparse checkout path for the Codex marketplace source',
-    })
-    .option('codex-marketplace-name', {
-      type: 'string',
-      describe: 'Codex marketplace name',
-    })
-    .option('codex-plugin-ref', {
-      type: 'string',
-      describe: 'Codex plugin ref, e.g. codexmux@dreamux',
-    })
-    .option('claude-bin', {
-      type: 'string',
-      describe: 'Claude CLI binary or absolute path',
-    })
-    .option('claude-config-dir', {
-      type: 'string',
-      describe: 'Claude config directory used for plugin installation',
-    })
-    .option('claude-marketplace-source', {
-      type: 'string',
-      describe: 'Claude plugin marketplace source',
-    })
-    .option('claude-marketplace-sparse', {
-      type: 'array',
-      string: true,
-      describe: 'Sparse checkout path for the Claude marketplace source',
-    })
-    .option('claude-marketplace-name', {
-      type: 'string',
-      describe: 'Claude marketplace name',
-    })
-    .option('claude-plugin-ref', {
-      type: 'string',
-      describe: 'Claude plugin ref, e.g. claudemux@claudemux',
     })
     .option('bot-app-id', {
       type: 'string',
@@ -265,7 +230,7 @@ function buildUninstallCommand(y: Argv): Argv {
     })
     .option('runtime-dir', {
       type: 'string',
-      describe: 'dreamux runtime directory',
+      describe: 'Legacy option ignored; uninstall removes dreamux state/log paths',
     });
 }
 
@@ -301,6 +266,9 @@ function printOnboardResult(result: OnboardRunResult): void {
 }
 
 function printUninstallResult(result: UninstallRunResult): void {
+  for (const warning of result.warnings) {
+    console.error(`warning: ${warning}`);
+  }
   console.log('dreamux uninstall file ledger:');
   for (const entry of result.entries) {
     console.log(`${entry.status}\t${entry.path}\t${entry.reason}`);
@@ -323,24 +291,34 @@ function buildConfigCommands(y: Argv): Argv {
     .command(
       'show',
       'Print the dreamux global config file',
-      (yy) =>
-        yy.option('raw', {
-          type: 'boolean',
-          describe: 'Print unredacted config, including channel secrets',
-        }),
-      (argv) => {
+      (yy) => yy,
+      () => {
         const file = globalConfigFile();
         if (!existsSync(file)) {
           throw new Error(`config file does not exist: ${file}`);
         }
+        assertConfigFileMode(file);
         const raw = readFileSync(file, 'utf8');
-        process.stdout.write(
-          argv.raw === true ? raw : redactConfigForDisplay(raw, file),
-        );
+        process.stdout.write(redactConfigForDisplay(raw, file));
       },
     )
     .demandCommand(1, 'Choose a config command')
     .strict();
+}
+
+function buildFeishuMcpCommand(
+  y: Argv,
+): Argv<{ dispatcher: string; adminSocket?: string }> {
+  return y
+    .option('dispatcher', {
+      type: 'string',
+      demandOption: true,
+      describe: 'Dispatcher id this MCP shim is scoped to',
+    })
+    .option('admin-socket', {
+      type: 'string',
+      describe: 'dreamux serve admin socket path',
+    }) as Argv<{ dispatcher: string; adminSocket?: string }>;
 }
 
 async function main(): Promise<void> {
@@ -393,6 +371,17 @@ async function main(): Promise<void> {
       'dispatcher <command>',
       'Manage dispatchers',
       buildDispatcherCommands,
+    )
+    .command(
+      'feishu-mcp',
+      'Run the dispatcher-scoped Feishu MCP stdio shim',
+      buildFeishuMcpCommand,
+      async (argv) => {
+        await runFeishuMcp({
+          dispatcherId: validateDispatcherId(argv.dispatcher),
+          adminSocketPath: argv.adminSocket,
+        });
+      },
     )
     .command('config <command>', 'Inspect config', buildConfigCommands)
     .demandCommand(1, 'Choose a command')

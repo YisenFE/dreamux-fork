@@ -1,27 +1,23 @@
 /**
- * Filesystem layout for the codex-host server runtime.
+ * Filesystem layout for dreamux-owned runtime state and logs.
  *
- * Default root: ~/.codex-host/  (override via env CODEX_HOST_RUNTIME_DIR
- * or `runtime_dir` in ~/.dreamux/config.json — env wins, see config.ts).
- * Layout:
- *   <root>/
- *     state.db                  SQLite database (dispatchers + inbound_buffer)
- *     admin.sock                server-ctl admin Unix socket
- *     dispatchers/<id>/
- *       app-server-control/     Codex app-server control sockets
- *       stdout.log              Codex stdout
- *       stderr.log              Codex stderr (load-bearing for debug)
+ * Effective MVP layout:
+ *   ~/.dreamux/
+ *     state/
+ *       server.json
+ *       admin.sock
+ *       <dispatcher-id>/
+ *         status.json
+ *         access.json
+ *         codex.sock          Codex app-server Unix socket
+ *     logs/
+ *       dreamux-server.log
+ *       codex-app-server/
+ *         <dispatcher-id>.log
  *
- * Dispatchers intentionally inherit the operator's existing CODEX_HOME (or
- * Codex's own default when the env var is unset). Runtime/socket/log/db state
- * is still owned by dreamux under runtimeRoot(). Dispatcher cwd is configured
- * during onboard and stored on the dispatcher row; dispatcherCodexCwd() exists
- * only as a legacy fallback.
- *
- * Issue ~/.dreamux/ config (feat/global-config-dir): paths.* functions
- * read an optionally-injected `DreamuxConfig` snapshot for non-env
- * defaults. Server.start() calls setRuntimeConfig() once at boot; bare
- * tests / standalone callers fall back to the built-in defaults.
+ * `runtime_dir` is not an effective runtime contract. The legacy runtimeRoot()
+ * function remains as a compatibility alias for stateRoot() while older call
+ * sites are retired.
  */
 
 import { homedir } from 'node:os';
@@ -29,16 +25,18 @@ import { join } from 'node:path';
 
 import {
   BUILT_IN_DEFAULTS,
-  expandHome,
   type DreamuxConfig,
 } from './config.js';
+import { validateDispatcherId } from './dispatcher-id.js';
+
+export const DREAMUX_UNIX_SOCKET_PATH_MAX_BYTES = 103;
 
 let currentConfig: DreamuxConfig = BUILT_IN_DEFAULTS;
 
 /**
  * Set the active configuration snapshot. Called once by Server.start() with
- * the result of loadOrInitConfig(); tests can call it to inject a custom
- * snapshot. Idempotent.
+ * the result of loadConfig(); tests can call it to inject a custom snapshot.
+ * Idempotent.
  */
 export function setRuntimeConfig(config: DreamuxConfig): void {
   currentConfig = config;
@@ -53,27 +51,38 @@ export function getRuntimeConfig(): DreamuxConfig {
   return currentConfig;
 }
 
-export function runtimeRoot(): string {
-  const fromEnv = process.env['CODEX_HOST_RUNTIME_DIR'];
-  if (fromEnv !== undefined && fromEnv !== '') return fromEnv;
-  return expandHome(currentConfig.runtime_dir) || join(homedir(), '.codex-host');
+export function dreamuxRoot(): string {
+  return join(homedir(), '.dreamux');
 }
 
-export function databasePath(): string {
-  return join(runtimeRoot(), 'state.db');
+export function stateRoot(): string {
+  return join(dreamuxRoot(), 'state');
+}
+
+export function serverJsonPath(): string {
+  return join(stateRoot(), 'server.json');
+}
+
+export function logsRoot(): string {
+  return join(dreamuxRoot(), 'logs');
+}
+
+/**
+ * Legacy compatibility alias. New code should call stateRoot().
+ */
+export function runtimeRoot(): string {
+  return stateRoot();
 }
 
 export function adminSocketPath(): string {
-  const fromEnv = process.env['CODEX_HOST_ADMIN_SOCKET'];
-  if (fromEnv !== undefined && fromEnv !== '') return fromEnv;
-  if (currentConfig.admin_socket !== null) {
-    return expandHome(currentConfig.admin_socket);
-  }
-  return join(runtimeRoot(), 'admin.sock');
+  return assertUnixSocketPathBudget(
+    join(stateRoot(), 'admin.sock'),
+    'admin socket path',
+  );
 }
 
 export function dispatcherDir(id: string): string {
-  return join(runtimeRoot(), 'dispatchers', id);
+  return join(stateRoot(), dispatcherPathSegment(id));
 }
 
 export function dispatcherCodexCwd(id: string): string {
@@ -81,8 +90,6 @@ export function dispatcherCodexCwd(id: string): string {
 }
 
 export function operatorCodexHome(): string {
-  const fromEnv = process.env['CODEX_HOME'];
-  if (fromEnv !== undefined && fromEnv !== '') return fromEnv;
   return join(homedir(), '.codex');
 }
 
@@ -95,22 +102,73 @@ export function dispatcherCodexConfigPath(id: string): string {
   return join(dispatcherCodexHome(id), 'config.toml');
 }
 
-export function dispatcherCodexPluginsDir(id: string): string {
-  return join(dispatcherCodexHome(id), 'plugins');
+export function dispatcherWorkspaceCodexSkillsDir(cwd: string): string {
+  return join(cwd, '.codex', 'skills');
+}
+
+export function dispatcherWorkspaceSkillPath(cwd: string): string {
+  return join(dispatcherWorkspaceCodexSkillsDir(cwd), 'dispatcher', 'SKILL.md');
 }
 
 export function dispatcherAppServerControlDir(id: string): string {
-  return join(dispatcherDir(id), 'app-server-control');
+  return dispatcherDir(id);
 }
 
 export function dispatcherSocketPath(id: string): string {
-  return join(dispatcherAppServerControlDir(id), 'as.sock');
+  return assertUnixSocketPathBudget(
+    join(dispatcherDir(id), 'codex.sock'),
+    `dispatcher '${id}' Codex socket path`,
+  );
 }
 
 export function dispatcherStdoutLog(id: string): string {
-  return join(dispatcherDir(id), 'stdout.log');
+  return dispatcherCodexAppServerLogPath(id);
 }
 
 export function dispatcherStderrLog(id: string): string {
-  return join(dispatcherDir(id), 'stderr.log');
+  return dispatcherCodexAppServerErrorLogPath(id);
+}
+
+export function serverLogPath(): string {
+  return join(logsRoot(), 'dreamux-server.log');
+}
+
+export function codexAppServerLogDir(): string {
+  return join(logsRoot(), 'codex-app-server');
+}
+
+export function feishuChannelLogDir(): string {
+  return join(logsRoot(), 'feishu-channel');
+}
+
+export function dispatcherCodexAppServerLogPath(id: string): string {
+  return join(codexAppServerLogDir(), `${dispatcherPathSegment(id)}.log`);
+}
+
+export function dispatcherCodexAppServerErrorLogPath(id: string): string {
+  return join(codexAppServerLogDir(), `${dispatcherPathSegment(id)}.stderr.log`);
+}
+
+export function dispatcherStatusPath(id: string): string {
+  return join(dispatcherDir(id), 'status.json');
+}
+
+export function dispatcherAccessPath(id: string): string {
+  return join(dispatcherDir(id), 'access.json');
+}
+
+export function unixSocketPathFitsBudget(path: string): boolean {
+  return Buffer.byteLength(path, 'utf8') <= DREAMUX_UNIX_SOCKET_PATH_MAX_BYTES;
+}
+
+export function assertUnixSocketPathBudget(path: string, label: string): string {
+  if (unixSocketPathFitsBudget(path)) return path;
+  const bytes = Buffer.byteLength(path, 'utf8');
+  throw new Error(
+    `${label} is too long for Unix sockets (${bytes} bytes > ${DREAMUX_UNIX_SOCKET_PATH_MAX_BYTES} safe bytes): ${path}`,
+  );
+}
+
+export function dispatcherPathSegment(id: string): string {
+  return validateDispatcherId(id);
 }

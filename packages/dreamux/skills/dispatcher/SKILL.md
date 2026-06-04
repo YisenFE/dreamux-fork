@@ -1,9 +1,9 @@
 ---
-name: codexmux-dispatcher
-description: Use from a dreamux dispatcher thread when work should be delegated to a tm-managed Codex teammate in a specific repository. Applies to bounded engineering tasks, test runs, codebase inspections, or follow-up work where the dispatcher should spawn/send/wait through the pinned @excitedjs/tm CLI and report the result back to the source chat.
+name: dispatcher
+description: Use from a dreamux dispatcher thread when work should be delegated to a tm-managed Codex teammate in a specific repository. Applies to bounded engineering tasks, test runs, codebase inspections, or follow-up work where the dispatcher should spawn/send/wait through the tm CLI exposed by the dreamux package and report the result back to the source chat.
 ---
 
-# Codexmux Dispatcher
+# Dispatcher
 
 Use this skill only from the dispatcher agent. The dreamux server hosts the
 dispatcher lifecycle; it does not own tm teammate daemons, teammate DB rows, or
@@ -11,12 +11,14 @@ dispatcher lifecycle; it does not own tm teammate daemons, teammate DB rows, or
 
 ## Boundaries
 
-- Use `tm` through the pinned package: `@excitedjs/tm@2.1.2`.
+- Use `tm` from the dispatcher environment PATH. dreamux injects its package
+  `bin/` directory into the dispatcher Codex app-server PATH.
 - Pass `--engine codex` on every `tm spawn`; `tm spawn` defaults to Claude.
-- Do not use bare `npx -y @excitedjs/tm` or `@excitedjs/tm@latest`.
+- Do not use `npx`, `npm exec --package @excitedjs/tm`, or
+  `@excitedjs/tm@latest`; the dreamux package owns the tm dependency version.
 - Do not call dreamux admin APIs to create teammate state.
-- Do not infer a repo from the dispatcher cwd. A dispatcher cwd is server-owned
-  runtime space, not a worktree.
+- Do not infer the tm repo path from the dispatcher cwd unless the user or
+  operator explicitly made that cwd the requested repo.
 - Do not ask a tm-managed teammate to spawn another tm teammate.
 
 ## Before Delegating
@@ -37,16 +39,10 @@ make it absolute only when its base is explicit.
 
 ## Command Shape
 
-Use this prefix for every tm command:
+Preflight once per dispatcher session:
 
 ```bash
-npm exec --yes --package @excitedjs/tm@2.1.2 -- tm
-```
-
-Preflight once per dispatcher session or after npm cache cleanup:
-
-```bash
-npm exec --yes --package @excitedjs/tm@2.1.2 -- tm --help
+tm --help
 ```
 
 ## First-Turn Delegation
@@ -56,7 +52,7 @@ npm exec --yes --package @excitedjs/tm@2.1.2 -- tm --help
 2. Spawn with the repo path, intent, and the full task prompt:
 
 ```bash
-npm exec --yes --package @excitedjs/tm@2.1.2 -- tm spawn /absolute/repo \
+tm spawn /absolute/repo \
   --name tests-api \
   --engine codex \
   --timeout 180 \
@@ -69,7 +65,7 @@ npm exec --yes --package @excitedjs/tm@2.1.2 -- tm spawn /absolute/repo \
    without `--fresh`:
 
 ```bash
-npm exec --yes --package @excitedjs/tm@2.1.2 -- tm wait tests-api --timeout 180
+tm wait tests-api --timeout 180
 ```
 
 4. Reply to the source chat with the teammate result, including the command
@@ -81,9 +77,9 @@ If a teammate name already exists for the same task, send a follow-up instead
 of spawning a duplicate:
 
 ```bash
-npm exec --yes --package @excitedjs/tm@2.1.2 -- tm send tests-api \
+tm send tests-api \
   --prompt "Use the previous context. Re-run the focused test after the latest fix and summarize only changed results."
-npm exec --yes --package @excitedjs/tm@2.1.2 -- tm wait tests-api --timeout 180
+tm wait tests-api --timeout 180
 ```
 
 ## Failure Reporting
@@ -104,7 +100,7 @@ codex daemon (pid N) exited before binding /tmp/teammate-codex/<name>/socket
 
 That means the Codex app-server daemon did not become reachable. Do not retry
 silently; report the environment failure and ask the operator to verify
-`codex app-server --listen unix:///tmp/codexmux-check.sock` in the dispatcher
+`codex app-server --listen unix:///tmp/dispatcher-check.sock` in the dispatcher
 environment.
 
 Do not say the dreamux server lost or recovered teammate state. The server does

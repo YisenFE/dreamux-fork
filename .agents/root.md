@@ -7,10 +7,16 @@ when you need the *why* behind a piece of code or a decision history.
 ## What dreamux is
 
 A long-running Node process that hosts N **Dispatchers**. Each Dispatcher
-binds **1 Feishu bot + 1 Codex thread**; all of that bot's inbound chats
-funnel into the same thread, and outbound replies route back to the
-message's source chat. Background and the full P0 design are in GitHub
-issues:
+binds **1 Feishu channel + 1 Codex app-server child + 1 Codex thread + 1
+Feishu MCP endpoint**. All inbound chats for a dispatcher enter that
+dispatcher's single Codex thread; Feishu outbound is sent only when Codex
+calls the dispatcher-bound `feishu` MCP server. The current top-level
+architecture is:
+
+- [Top-level design](decisions/top-level-design.md) — current source of truth
+  for runtime state, Feishu MCP, access gating, and config shape.
+
+Background and older issue context:
 
 - [#1 Proposal](https://github.com/excitedjs/dreamux/issues/1) — original proposal
 - [#2 Engineering plan](https://github.com/excitedjs/dreamux/issues/2) — implementation-ready spec
@@ -21,15 +27,15 @@ issues:
 
 ```
 /                                  rush monorepo root
-├── codex-marketplace/             local Codex marketplace for codexmux
 ├── rush.json                      rush + pnpm config
 ├── common/                        rush scaffolding (config + bootstrap)
 ├── packages/
 │   ├── dreamux/                   @excitedjs/dreamux — the host server
-│   │   ├── bin/                   single dreamux launcher
-│   │   ├── src/                   admin, cli, codex, db, dispatcher, feishu, runtime
+│   │   ├── bin/                   dreamux and tm launchers
+│   │   ├── skills/                bundled dispatcher Codex skill
+│   │   ├── src/                   admin, cli, codex, dispatcher, feishu, runtime, legacy db
 │   │   ├── tests/                 vitest (smoke + live-codex + bin-launcher + onboard)
-│   │   └── db/migrations/         SQLite schema migrations
+│   │   └── db/migrations/         legacy SQLite migrations targeted for removal
 │   └── channel/
 │       ├── feishu-transport/      @excitedjs/feishu-transport — platform-I/O core
 │       │                          (sole @larksuiteoapi/node-sdk importer)
@@ -42,14 +48,22 @@ issues:
 
 ## Navigation
 
-- [`components/`](components/) — one doc per piece (repo-structure today;
-  codex-marketplace today; server / codex-client / feishu-bot / cli to be
+- [`components/`](components/) — one doc per piece (repo-structure and
+  dispatcher-skill today; server / codex-client / feishu-bot / cli to be
   added as they stabilize).
+- [`decisions/top-level-design.md`](decisions/top-level-design.md) — current
+  top-level design; read this before runtime, Feishu, MCP, config, state, or
+  dispatcher-lifecycle work.
 - [`decisions/README.md`](decisions/README.md) — accepted decision records,
   indexed by topic slug. Do not prefix new records with sequence numbers.
 - [`proposals/global-bin-onboard-serve.md`](proposals/global-bin-onboard-serve.md)
-  — active issue #18 spec for the global `dreamux` bin, onboarding wizard,
-  service registration, and `serve` runtime.
+  — superseded issue #18 proposal; accepted behavior lives in
+  [`decisions/global-bin-onboard-serve.md`](decisions/global-bin-onboard-serve.md).
+- [`proposals/post-mvp-hardening.md`](proposals/post-mvp-hardening.md) —
+  consolidated post-MVP hardening proposal (bounded state, restart/startup
+  reconciliation, access surface, message-format, CLI/diagnostic robustness);
+  groups the deferred epic follow-ups + the #58 ultracode findings into the next
+  workstream.
 - `domains/`, `proposals/`, `research/`, `rules/` — empty for now; add
   here when material grows past a single file's worth.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — when to update this KB, how to
@@ -61,16 +75,18 @@ issues:
 
 | You're about to ... | Read first |
 |---|---|
-| add/change the Codex plugin marketplace or dispatcher skill | [`components/codex-marketplace.md`](components/codex-marketplace.md) |
+| add/change the dispatcher Codex skill or `tm` wrapper | [`components/dispatcher-skill.md`](components/dispatcher-skill.md) |
+| change dispatcher `tm` packaging, PATH injection, or skill install location | [`decisions/dispatcher-tm-packaging.md`](decisions/dispatcher-tm-packaging.md) |
 | add/change a package, move source between packages | [`components/repo-structure.md`](components/repo-structure.md) |
+| modify runtime state, dispatcher lifecycle, Feishu MCP, access gating, or config shape | [`decisions/top-level-design.md`](decisions/top-level-design.md) |
 | browse decisions by topic | [`decisions/README.md`](decisions/README.md) |
 | understand why rush + pnpm | [`decisions/rush-pnpm-monorepo.md`](decisions/rush-pnpm-monorepo.md) |
 | install / build / test the repo, or wonder why `npm ci` is gone | [`decisions/install-model.md`](decisions/install-model.md) |
 | rename or restructure the public CLI / package | [`decisions/cli-and-package-naming.md`](decisions/cli-and-package-naming.md) |
 | implement issue #18 global bin / onboard / serve | [`proposals/global-bin-onboard-serve.md`](proposals/global-bin-onboard-serve.md) + [`decisions/global-bin-onboard-serve.md`](decisions/global-bin-onboard-serve.md) |
-| add / change a global config key (`~/.dreamux/config.json`) | [`decisions/global-config-dir.md`](decisions/global-config-dir.md) |
+| add / change a config key (`~/.dreamux/config.json`) | [`decisions/top-level-design.md`](decisions/top-level-design.md) first, then historical context in [`decisions/global-config-dir.md`](decisions/global-config-dir.md) |
 | touch the anti-leak guardrail (`.gitleaks.toml`, `.npmrc`, CI / hook) | [`decisions/anti-leak-guardrail.md`](decisions/anti-leak-guardrail.md) |
 | touch npm publishing / the release workflows | [`decisions/npm-release-oidc.md`](decisions/npm-release-oidc.md) |
 | add or verify Rush change files | [`components/repo-structure.md#rush-change-files`](components/repo-structure.md#rush-change-files) |
 | write a new decision record / new component doc | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
-| modify the server runtime / Codex protocol handling | the issue links above + read the source — runtime details aren't yet promoted to the KB |
+| modify the server runtime / Codex protocol handling | [`decisions/top-level-design.md`](decisions/top-level-design.md) + read the source |

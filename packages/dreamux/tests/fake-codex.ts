@@ -8,8 +8,8 @@
  *                                 item/completed (agentMessage)
  *                                 turn/completed
  *
- * Lets tests assert behavior (FIFO, crash recovery, outbound retry, approval
- * fail-fast) without spawning a real codex binary.
+ * Lets tests assert behavior (queueing, coalescing, MCP reply-only outbound,
+ * approval fail-fast) without spawning a real codex binary.
  */
 
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -60,8 +60,11 @@ export async function startFakeCodex(opts: FakeCodexOptions = {}): Promise<FakeC
   let initializedAt: number | null = null;
   const methodLog: string[] = [];
   const enforceInit = opts.enforceInitHandshake !== false;
+  const clients = new Set<WebSocket>();
 
   wss.on('connection', (ws: WebSocket) => {
+    clients.add(ws);
+    ws.on('close', () => clients.delete(ws));
     ws.on('message', (data) => {
       let env: { method?: string; id?: number; params?: Record<string, unknown> };
       try {
@@ -199,6 +202,7 @@ export async function startFakeCodex(opts: FakeCodexOptions = {}): Promise<FakeC
       return methodLog;
     },
     async close(): Promise<void> {
+      for (const ws of clients) ws.terminate();
       await new Promise<void>((res) => wss.close(() => res()));
       await new Promise<void>((res) => http.close(() => res()));
     },

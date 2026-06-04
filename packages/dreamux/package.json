@@ -14,12 +14,13 @@
     "node": ">=22.7"
   },
   "bin": {
-    "dreamux": "./bin/dreamux"
+    "dreamux": "./bin/dreamux",
+    "tm": "./bin/tm"
   },
   "files": [
     "bin",
     "dist",
-    "db",
+    "skills",
     "README.md",
     "LICENSE"
   ],
@@ -33,7 +34,7 @@
   },
   "dependencies": {
     "@excitedjs/feishu-transport": "workspace:*",
-    "better-sqlite3": "^11.5.0",
+    "@excitedjs/tm": "2.2.1",
     "smol-toml": "^1.6.1",
     "ws": "^8.18.0",
     "yargs": "^17.7.2",
@@ -42,7 +43,6 @@
     "plist": "^5.0.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
     "@types/yargs": "^17.0.35",

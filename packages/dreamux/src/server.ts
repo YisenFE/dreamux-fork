@@ -2,23 +2,16 @@
  * The dreamux Server — the long-running Node process that hosts N dispatchers.
  *
  * Lifecycle:
- *   1. open SQLite (migrate if needed)
+ *   1. load dispatcher declarations from config
  *   2. open admin Unix socket (so server-ctl can talk to us even if a
  *      dispatcher fails to come up)
  *   3. for each enabled dispatcher: spawn codex, open feishu, start turn worker
  *   4. install SIGTERM/SIGINT handlers for graceful drain
  *
- * Issue #2 §"D1": crash recovery does NOT replay running turns. Per dispatcher,
- * the runtime's startup sweep flips stale `running` → `unknown` before
- * Feishu inbound is opened, so the user gets a visible prompt instead of a
- * silent duplicate turn.
+ * Current MVP: accepted inbound work is process-local. Restarting the server
+ * drops queued and in-flight inbound messages instead of replaying them.
  */
 
-import type Database from 'better-sqlite3';
-
-import { openDatabase } from './db/schema.js';
-import { DispatcherRepo, InboundRepo } from './db/repository.js';
-import type { DispatcherRow, DispatcherStatus } from './db/types.js';
 import { DispatcherRuntime } from './dispatcher/runtime.js';
 import type { CodexProcess, CodexProcessOptions } from './codex/supervisor.js';
 import type { CodexWsClient } from './codex/rpc.js';
@@ -28,18 +21,31 @@ import {
   type FeishuBot,
   type FeishuInboundEvent,
 } from './feishu/bot.js';
-import { compatibleFeishuGate } from './channel/feishu-gate.js';
+import {
+  dreamuxFeishuGate,
+  loadDispatcherAccess,
+  saveDispatcherAccess,
+} from './channel/feishu-gate.js';
+import { formatFeishuMessageForCodex } from './channel/feishu-message.js';
 import { parseCodexArgs, codexArgsToCli } from './runtime/codex-args.js';
+import { feishuMcpCodexArgs } from './codex/mcp-config.js';
 import { resolveBotSecret } from './runtime/secrets.js';
 import { BUILT_IN_DEFAULTS, type DreamuxConfig } from './runtime/config.js';
+import {
+  DispatcherStore,
+  type DispatcherRow,
+  type DispatcherStatus,
+} from './runtime/dispatcher-store.js';
 import type { DispatcherCodexHomeDoctor } from './runtime/dispatcher-codex-home.js';
 import {
   adminSocketPath,
-  databasePath,
   dispatcherCodexCwd,
   setRuntimeConfig,
 } from './runtime/paths.js';
 import { createAdminSocketServer, type AdminSocketServer } from './admin/socket.js';
+
+export const RECEIVED_REACTION_EMOJI = 'GLANCE';
+const MAX_PENDING_RECEIVED_REACTION_CLEARS = 1024;
 
 export interface ServerOptions {
   /**
@@ -49,8 +55,6 @@ export interface ServerOptions {
    * the file and pass it in so user edits take effect.
    */
   config?: DreamuxConfig;
-  /** Override database path (tests). */
-  databasePath?: string;
   /** Override admin socket path (tests). */
   adminSocketPath?: string;
   /** Inject a custom bot factory (tests use this to plug in a fake). */
@@ -65,22 +69,44 @@ export interface ServerOptions {
   codexHomeDoctor?: DispatcherCodexHomeDoctor;
   /** Skip resolving bot secret (tests with fake bot). */
   skipBotSecret?: boolean;
+  /** Codex child/WS restart backoff base override (tests). */
+  codexRestartBackoffBaseMs?: number;
+  /** Codex child/WS restart backoff cap override (tests). */
+  codexRestartBackoffMaxMs?: number;
 }
 
 export interface Repos {
-  dispatchers: DispatcherRepo;
-  inbound: InboundRepo;
+  dispatchers: DispatcherStore;
 }
 
 interface DispatcherSlot {
   row: DispatcherRow;
   runtime: DispatcherRuntime;
   bot: FeishuBot;
+  channelState: DispatcherChannelState;
+}
+
+interface DispatcherChannelState {
+  receivedReactions: Map<string, { chatId: string; reactionId: string }>;
+  pendingReceivedReactionClears: Set<string>;
+}
+
+export interface ServerMcpReplyInput {
+  dispatcherId: string;
+  chatId: string;
+  text: string;
+  messageId?: string;
+  mentionUserIds?: string[];
+}
+
+export interface ServerMcpReactInput {
+  dispatcherId: string;
+  messageId: string;
+  emoji: string;
 }
 
 export class Server {
   readonly repos: Repos;
-  private readonly db: Database.Database;
   private readonly slots = new Map<string, DispatcherSlot>();
   /**
    * PR #3 review #4: in-flight startDispatcher promises, keyed by id.
@@ -98,10 +124,8 @@ export class Server {
     // happens. paths.runtimeRoot / adminSocketPath / etc. consult this
     // snapshot for non-env defaults (env vars still win).
     setRuntimeConfig(opts.config ?? BUILT_IN_DEFAULTS);
-    this.db = openDatabase({ path: opts.databasePath ?? databasePath() });
     this.repos = {
-      dispatchers: new DispatcherRepo(this.db),
-      inbound: new InboundRepo(this.db),
+      dispatchers: new DispatcherStore(opts.config ?? BUILT_IN_DEFAULTS),
     };
   }
 
@@ -174,57 +198,78 @@ export class Server {
     if (this.slots.has(id)) return;
 
     const cfg = this.effectiveConfig();
+    const dispatcherConfig = cfg.dispatchers.find(
+      (dispatcher) => dispatcher.id === id,
+    );
     const codexArgs = parseCodexArgs(row.codex_args_json, {
       approvalPolicy: cfg.codex.approval_policy,
       sandboxMode: cfg.codex.sandbox_mode,
       extraArgs: cfg.codex.extra_args,
     });
+    const codexCliArgs = [
+      ...codexArgsToCli(codexArgs),
+      ...feishuMcpCodexArgs({
+        dispatcherId: id,
+        adminSocketPath: this.opts.adminSocketPath ?? adminSocketPath(),
+      }),
+    ];
     const botSecret = this.opts.skipBotSecret
       ? ''
       : resolveBotSecret(row.bot_secret_ref, cfg);
     const bot = this.opts.botFactory
       ? this.opts.botFactory(row, botSecret)
       : createFeishuBot({ appId: row.bot_app_id, appSecret: botSecret });
+    const channelState: DispatcherChannelState = {
+      receivedReactions: new Map(),
+      pendingReceivedReactionClears: new Set(),
+    };
 
     const runtime = new DispatcherRuntime(row, {
       dispatchers: this.repos.dispatchers,
-      inbound: this.repos.inbound,
-      outbound: {
-        send: async (target, text) =>
-          (await bot.send(channelOutboundToFeishuTarget(target), text)).messageIds,
-      },
       codexBinPath: this.resolveCodexBinPath(),
       codexProcessFactory: this.opts.codexProcessFactory,
       codexClientFactory: this.opts.codexClientFactory,
       codexHomeDoctor: this.opts.codexHomeDoctor,
-      resolveExtraArgs: () => codexArgsToCli(codexArgs),
+      resolveExtraArgs: () => codexCliArgs,
       handshakeTimeoutMs: cfg.codex.initialize_timeout_ms,
-      outboundRetries: cfg.outbound.retries,
-      outboundRetryDelayMs: cfg.outbound.retry_delay_ms,
+      extraEnv: dispatcherConfig?.codex.extra_env ?? {},
+      restartBackoffBaseMs: this.opts.codexRestartBackoffBaseMs,
+      restartBackoffMaxMs: this.opts.codexRestartBackoffMaxMs,
     });
 
     try {
       await runtime.start();
       await bot.start(async (event: FeishuInboundEvent) => {
-        const gate = compatibleFeishuGate({
+        const access = loadDispatcherAccess(id);
+        const gate = dreamuxFeishuGate({
           senderId: event.senderId,
           senderType: event.senderType,
+          chatId: event.chatId,
           chatType: event.chatType,
+          mentions: event.mentions,
           botOpenId: bot.botOpenId,
-        });
+        }, access);
+        saveDispatcherAccess(id, gate.access);
+        if (gate.warning !== null) {
+          console.error(
+            `[server] trust-domain warning for dispatcher '${id}': ${gate.warning}`,
+          );
+        }
         if (gate.action === 'drop') {
           console.error(
             `[server] dropped feishu inbound for dispatcher '${id}': ${gate.reason}`,
           );
           return;
         }
-        runtime.enqueueInbound({
+        const queued = runtime.enqueueInbound({
           source_chat_id: event.chatId,
           source_message_id: event.messageId,
           sender_id: event.senderId,
-          feishu_event_json: safeStringify(event.raw),
-          parsed_text: event.parsedText,
+          parsed_text: formatFeishuMessageForCodex(event),
         });
+        if (queued) {
+          await addReceivedReaction(id, bot, channelState, event);
+        }
       });
     } catch (err) {
       // Failed midway: undo any partial bring-up so a retry isn't
@@ -242,7 +287,7 @@ export class Server {
       throw err;
     }
 
-    this.slots.set(id, { row, runtime, bot });
+    this.slots.set(id, { row, runtime, bot, channelState });
     console.error(
       `[server] dispatcher '${id}' is ready (bot=${row.bot_app_id} cwd=${row.codex_cwd ?? dispatcherCodexCwd(id)})`,
     );
@@ -269,7 +314,44 @@ export class Server {
     return this.slots.get(id)?.runtime ?? null;
   }
 
-  /** Summary of every declared dispatcher (DB-backed, includes stopped). */
+  async replyFromMcp(input: ServerMcpReplyInput): Promise<{ message_ids: string[] }> {
+    const slot = this.mustRunningSlot(input.dispatcherId);
+    const result = await slot.bot.send(
+      channelOutboundToFeishuTarget({
+        conversationId: input.chatId,
+        ...(input.messageId !== undefined ? { replyTo: input.messageId } : {}),
+        ...(input.mentionUserIds !== undefined
+          ? { mentionUsers: input.mentionUserIds }
+          : {}),
+      }),
+      input.text,
+    );
+    if (input.messageId !== undefined) {
+      await clearReceivedReaction(
+        input.dispatcherId,
+        slot.bot,
+        slot.channelState,
+        input.messageId,
+      );
+    }
+    return { message_ids: result.messageIds };
+  }
+
+  async reactFromMcp(input: ServerMcpReactInput): Promise<{ reaction_id: string }> {
+    const slot = this.mustRunningSlot(input.dispatcherId);
+    const reactionId = await slot.bot.addReaction(input.messageId, input.emoji);
+    return { reaction_id: reactionId };
+  }
+
+  private mustRunningSlot(id: string): DispatcherSlot {
+    const slot = this.slots.get(id);
+    if (slot === undefined) {
+      throw new Error(`dispatcher '${id}' is not running`);
+    }
+    return slot;
+  }
+
+  /** Summary of every declared dispatcher (config-backed, includes stopped). */
   summarize(): Array<{
     dispatcher_id: string;
     bot_app_id: string;
@@ -289,7 +371,7 @@ export class Server {
     });
   }
 
-  /** Graceful shutdown — drain dispatchers, close socket, close DB. */
+  /** Graceful shutdown — drain dispatchers and close the admin socket. */
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
@@ -301,18 +383,82 @@ export class Server {
       await this.admin.close();
       this.admin = null;
     }
-    try {
-      this.db.close();
-    } catch (err) {
-      console.error('[server] db close error:', err);
-    }
   }
 }
 
-function safeStringify(value: unknown): string {
+async function addReceivedReaction(
+  dispatcherId: string,
+  bot: FeishuBot,
+  channelState: DispatcherChannelState,
+  event: FeishuInboundEvent,
+): Promise<void> {
   try {
-    return JSON.stringify(value);
-  } catch {
-    return '{}';
+    const reactionId = await bot.addReaction(
+      event.messageId,
+      RECEIVED_REACTION_EMOJI,
+    );
+    if (reactionId === '') {
+      console.error(
+        `[server] Feishu returned no reaction_id for the received reaction in dispatcher '${dispatcherId}'`,
+      );
+      channelState.pendingReceivedReactionClears.delete(event.messageId);
+      return;
+    }
+    channelState.receivedReactions.set(event.messageId, {
+      chatId: event.chatId,
+      reactionId,
+    });
+    if (channelState.pendingReceivedReactionClears.has(event.messageId)) {
+      await clearReceivedReaction(
+        dispatcherId,
+        bot,
+        channelState,
+        event.messageId,
+      );
+    }
+  } catch (err) {
+    channelState.pendingReceivedReactionClears.delete(event.messageId);
+    console.error(
+      `[server] failed to add the received reaction for dispatcher '${dispatcherId}':`,
+      err,
+    );
+  }
+}
+
+async function clearReceivedReaction(
+  dispatcherId: string,
+  bot: FeishuBot,
+  channelState: DispatcherChannelState,
+  messageId: string,
+): Promise<void> {
+  const reaction = channelState.receivedReactions.get(messageId);
+  if (reaction === undefined) {
+    rememberPendingReceivedReactionClear(channelState, messageId);
+    return;
+  }
+  try {
+    await bot.removeReaction(messageId, reaction.reactionId);
+    channelState.receivedReactions.delete(messageId);
+    channelState.pendingReceivedReactionClears.delete(messageId);
+  } catch (err) {
+    console.error(
+      `[server] failed to clear the received reaction for dispatcher '${dispatcherId}' message '${messageId}':`,
+      err,
+    );
+  }
+}
+
+function rememberPendingReceivedReactionClear(
+  channelState: DispatcherChannelState,
+  messageId: string,
+): void {
+  channelState.pendingReceivedReactionClears.add(messageId);
+  while (
+    channelState.pendingReceivedReactionClears.size >
+    MAX_PENDING_RECEIVED_REACTION_CLEARS
+  ) {
+    const oldest = channelState.pendingReceivedReactionClears.values().next().value;
+    if (typeof oldest !== 'string') return;
+    channelState.pendingReceivedReactionClears.delete(oldest);
   }
 }

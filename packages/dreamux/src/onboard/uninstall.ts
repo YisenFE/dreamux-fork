@@ -11,12 +11,17 @@ import {
 import type { CommandRunner, ServicePlatform } from './types.js';
 import {
   assertNoLegacyTomlOnly,
-  BUILT_IN_DEFAULTS,
   expandHome,
   globalConfigDir,
   globalConfigFile,
   loadConfig,
+  type DispatcherConfig,
 } from '../runtime/config.js';
+import {
+  dispatcherWorkspaceSkillPath,
+  logsRoot,
+  stateRoot,
+} from '../runtime/paths.js';
 
 export type UninstallStatus = 'removed' | 'missing' | 'skipped';
 
@@ -38,6 +43,7 @@ export interface RunUninstallOptions {
 
 export interface UninstallRunResult {
   entries: UninstallEntry[];
+  warnings: string[];
   service: {
     platform: ServicePlatform;
     unitPath: string;
@@ -50,12 +56,17 @@ export async function runUninstall(
   const runner = options.runner ?? new ExecaCommandRunner();
   const dryRun = options.dryRun ?? false;
   const configDir = normalizePath(options.configDir ?? globalConfigDir());
-  const runtimeDir = normalizePath(resolveRuntimeDir(configDir, options.runtimeDir));
   const entries: UninstallEntry[] = [];
+  const warnings: string[] = [];
   const unit = serviceUnitPath(options.platform, options.homeDir ?? homedir());
+  warnIfConfigIsNotReadable(configDir, warnings);
+  const stateDir = normalizePath(stateRoot());
+  const logDir = normalizePath(logsRoot());
 
-  assertSafeOwnedDirectory(runtimeDir, 'dreamux runtime directory');
+  assertSafeOwnedDirectory(stateDir, 'dreamux state directory');
+  assertSafeOwnedDirectory(logDir, 'dreamux logs directory');
   assertSafeOwnedDirectory(configDir, 'dreamux config directory');
+  const workspaceSkillPaths = collectWorkspaceSkillPaths(configDir);
 
   await unregisterService({
     unitPath: unit.path,
@@ -70,11 +81,14 @@ export async function runUninstall(
     await runBestEffort(runner, 'systemctl', ['--user', 'daemon-reload'], dryRun);
   }
 
-  removeOwnedDirectory(runtimeDir, entries, 'dreamux runtime directory', dryRun);
+  reportWorkspaceSkills(workspaceSkillPaths, entries);
+  removeOwnedDirectory(stateDir, entries, 'dreamux state directory', dryRun);
+  removeOwnedDirectory(logDir, entries, 'dreamux logs directory', dryRun);
   removeOwnedDirectory(configDir, entries, 'dreamux config directory', dryRun);
 
   return {
     entries: entries.sort((a, b) => a.path.localeCompare(b.path)),
+    warnings,
     service: {
       platform: unit.platform,
       unitPath: unit.path,
@@ -82,13 +96,47 @@ export async function runUninstall(
   };
 }
 
-function resolveRuntimeDir(configDir: string, explicit: string | undefined): string {
-  if (explicit !== undefined && explicit !== '') return explicit;
-  assertNoLegacyTomlOnly({ configDir });
-  if (!existsSync(globalConfigFile({ configDir }))) {
-    return BUILT_IN_DEFAULTS.runtime_dir;
+function warnIfConfigIsNotReadable(configDir: string, warnings: string[]): void {
+  try {
+    assertNoLegacyTomlOnly({ configDir });
+    if (!existsSync(globalConfigFile({ configDir }))) return;
+    loadConfig({ configDir });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    warnings.push(
+      `could not validate dreamux config before uninstall; continuing with fixed state/log paths: ${message}`,
+    );
   }
-  return loadConfig({ configDir }).config.runtime_dir;
+}
+
+function collectWorkspaceSkillPaths(configDir: string): string[] {
+  try {
+    return loadConfig({ configDir }).config.dispatchers
+      .map(dispatcherWorkspaceSkillPathFromConfig)
+      .filter((path): path is string => path !== null);
+  } catch {
+    return [];
+  }
+}
+
+function dispatcherWorkspaceSkillPathFromConfig(
+  dispatcher: DispatcherConfig,
+): string | null {
+  if (dispatcher.cwd === null || dispatcher.cwd.trim() === '') return null;
+  return dispatcherWorkspaceSkillPath(dispatcher.cwd);
+}
+
+function reportWorkspaceSkills(
+  paths: string[],
+  entries: UninstallEntry[],
+): void {
+  for (const path of uniquePaths(paths)) {
+    entries.push({
+      path,
+      status: existsSync(path) ? 'skipped' : 'missing',
+      reason: 'workspace-local dispatcher skill (not removed)',
+    });
+  }
 }
 
 async function unregisterService(options: {
@@ -197,9 +245,7 @@ function normalizePath(path: string): string {
 function operatorStateRoots(): string[] {
   return uniquePaths([
     joinHome('.codex'),
-    process.env['CODEX_HOME'],
     joinHome('.claude'),
-    process.env['CLAUDE_CONFIG_DIR'],
   ]);
 }
 

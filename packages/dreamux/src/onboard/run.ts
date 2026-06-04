@@ -1,8 +1,5 @@
-import { existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync } from 'node:fs';
 
-import { DispatcherRepo } from '../db/repository.js';
-import { openDatabase } from '../db/schema.js';
 import { codexArgsToCli, parseCodexArgs } from '../runtime/codex-args.js';
 import {
   assertNoLegacyTomlOnly,
@@ -13,9 +10,11 @@ import {
 import {
   dispatcherAppServerControlDir,
   dispatcherCodexHome,
-  dispatcherCodexPluginsDir,
-  databasePath,
+  dispatcherWorkspaceCodexSkillsDir,
+  dispatcherWorkspaceSkillPath,
+  logsRoot,
   setRuntimeConfig,
+  stateRoot,
 } from '../runtime/paths.js';
 import {
   dispatcherCodexHomeDoctorContext,
@@ -24,22 +23,16 @@ import {
 } from '../runtime/dispatcher-codex-home.js';
 import { ExecaCommandRunner } from './commands.js';
 import {
-  dispatcherBotSecretRef,
   dispatcherCodexArgsJson,
   dreamuxConfigFromAnswers,
 } from './config-files.js';
+import { installDispatcherSkill } from './dispatcher-skill.js';
 import {
   ensureDirectory,
-  recordFileTreeChanges,
-  snapshotFiles,
   TransparentFileLedger,
   writeTextFile,
 } from './ledger.js';
 import { installUserService, managedServiceEnvironment } from './service.js';
-import {
-  installClaudemuxPlugin,
-  installCodexmuxPlugin,
-} from './plugins.js';
 import type {
   CommandRunner,
   OnboardAnswers,
@@ -69,7 +62,7 @@ export async function runOnboard(
   const dreamuxConfig = dreamuxConfigFromAnswers(answers, existingConfig);
   const effectiveAnswers = {
     ...answers,
-    runtimeDir: dreamuxConfig.runtime_dir,
+    runtimeDir: stateRoot(),
     codexBin: dreamuxConfig.codex.bin,
   };
   setRuntimeConfig(dreamuxConfig);
@@ -77,7 +70,10 @@ export async function runOnboard(
   ensureDirectory(answers.configDir, ledger, 'dreamux config directory', {
     dryRun: answers.dryRun,
   });
-  ensureDirectory(effectiveAnswers.runtimeDir, ledger, 'dreamux runtime directory', {
+  ensureDirectory(stateRoot(), ledger, 'dreamux state directory', {
+    dryRun: answers.dryRun,
+  });
+  ensureDirectory(logsRoot(), ledger, 'dreamux logs directory', {
     dryRun: answers.dryRun,
   });
   writeTextFile(
@@ -89,15 +85,9 @@ export async function runOnboard(
   );
 
   const codexHome = dispatcherCodexHome(answers.dispatcherId);
-  ensureDirectory(codexHome, ledger, 'operator Codex home', {
+  ensureDirectory(codexHome, ledger, 'global Codex home', {
     dryRun: answers.dryRun,
   });
-  ensureDirectory(
-    dispatcherCodexPluginsDir(answers.dispatcherId),
-    ledger,
-    'dispatcher Codex plugins directory',
-    { dryRun: answers.dryRun },
-  );
   ensureDirectory(
     dispatcherAppServerControlDir(answers.dispatcherId),
     ledger,
@@ -110,22 +100,18 @@ export async function runOnboard(
     'dispatcher cwd',
     { dryRun: answers.dryRun },
   );
-
-  await installCodexmuxPlugin({
-    answers: effectiveAnswers,
-    codexHome,
+  ensureDirectory(
+    dispatcherWorkspaceCodexSkillsDir(effectiveAnswers.dispatcherCwd),
     ledger,
-    runner,
-  });
+    'workspace-local Codex skills directory',
+    { dryRun: answers.dryRun },
+  );
 
-  await installClaudemuxPlugin({
-    answers: effectiveAnswers,
-    codexHome,
+  installDispatcherSkill({
+    skillPath: dispatcherWorkspaceSkillPath(effectiveAnswers.dispatcherCwd),
     ledger,
-    runner,
+    dryRun: answers.dryRun,
   });
-
-  registerDispatcher(effectiveAnswers, ledger);
 
   const doctor = runDispatcherDoctor(effectiveAnswers, dreamuxConfig, env);
   if (!effectiveAnswers.dryRun && !doctor.ok) {
@@ -157,35 +143,6 @@ function readExistingDreamuxConfig(configDir: string) {
   return loadConfig({ configDir }).config;
 }
 
-function registerDispatcher(
-  answers: OnboardAnswers,
-  ledger: OnboardFileLedger,
-): void {
-  const dbPath = databasePath();
-  ensureDirectory(dirname(dbPath), ledger, 'dispatcher database directory', {
-    dryRun: answers.dryRun,
-  });
-  if (answers.dryRun) {
-    ledger.record(dbPath, 'created', 'dispatcher database');
-    return;
-  }
-  mkdirSync(dirname(dbPath), { recursive: true });
-  const before = snapshotFiles(dirname(dbPath));
-  const db = openDatabase({ path: dbPath });
-  try {
-    new DispatcherRepo(db).upsert({
-      dispatcher_id: answers.dispatcherId,
-      bot_app_id: answers.botAppId,
-      bot_secret_ref: dispatcherBotSecretRef(answers.dispatcherId),
-      codex_args_json: dispatcherCodexArgsJson(),
-      codex_cwd: answers.dispatcherCwd,
-    });
-  } finally {
-    db.close();
-  }
-  recordFileTreeChanges(dirname(dbPath), before, ledger, 'dispatcher database');
-}
-
 function runDispatcherDoctor(
   answers: OnboardAnswers,
   dreamuxConfig: ReturnType<typeof dreamuxConfigFromAnswers>,
@@ -199,6 +156,7 @@ function runDispatcherDoctor(
   const codexCliArgs = codexArgsToCli(codexArgs);
   const context = dispatcherCodexHomeDoctorContext(answers.dispatcherId, {
     codexCliArgs,
+    dispatcherCwd: answers.dispatcherCwd,
   });
   if (answers.dryRun) {
     return {
@@ -230,7 +188,7 @@ function formatDoctorFailure(
   ) {
     lines.push(
       '- managed service environments do not inherit your interactive shell auth token',
-      `- authenticate the Codex home before registering the service: CODEX_HOME=${doctor.context.codexHome} ${answers.codexBin} login`,
+      `- authenticate the global Codex home before registering the service: ${answers.codexBin} login`,
     );
   }
   return lines.join('\n');
