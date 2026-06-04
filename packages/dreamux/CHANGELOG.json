@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.4.0",
+      "tag": "@excitedjs/dreamux_v0.4.0",
+      "date": "Thu, 04 Jun 2026 15:47:28 GMT",
+      "comments": {
+        "minor": [
+          {
+            "comment": "Add the Feishu event-registry seam (FeishuBot.start now takes a route object with onMessage + optional onBotMemberAdded) and the group /introduce hard contract: /introduce triggers only when the sender is allowlisted, with no @-mention of the bot required. A new chat-bots.json store separates passive bot awareness from introduced trust."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.3.3",
       "tag": "@excitedjs/dreamux_v0.3.3",
       "date": "Thu, 04 Jun 2026 14:09:37 GMT",

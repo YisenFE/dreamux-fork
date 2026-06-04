@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 14:09:37 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 15:47:28 GMT and should not be manually modified.
+
+## 0.4.0
+Thu, 04 Jun 2026 15:47:28 GMT
+
+### Minor changes
+
+- Add the Feishu event-registry seam (FeishuBot.start now takes a route object with onMessage + optional onBotMemberAdded) and the group /introduce hard contract: /introduce triggers only when the sender is allowlisted, with no @-mention of the bot required. A new chat-bots.json store separates passive bot awareness from introduced trust.
 
 ## 0.3.3
 Thu, 04 Jun 2026 14:09:37 GMT
