@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 18:47:15 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 19:41:43 GMT and should not be manually modified.
+
+## 0.6.2
+Thu, 04 Jun 2026 19:41:43 GMT
+
+### Patches
+
+- Log a distinct channel diagnostic ('introduce detected but not authorized') with a stable reason code (non_group / empty_sender_id / chat_not_allowlisted / sender_not_followed) when a group /introduce is detected but the sender is not authorized, instead of letting it surface as an ordinary gate drop (e.g. 'bot not mentioned'). Gate, trust, and /introduce semantics are unchanged (issue #77).
 
 ## 0.6.1
 Thu, 04 Jun 2026 18:47:15 GMT
