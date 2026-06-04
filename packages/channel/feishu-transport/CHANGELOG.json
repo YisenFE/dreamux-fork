@@ -2,6 +2,23 @@
   "name": "@excitedjs/feishu-transport",
   "entries": [
     {
+      "version": "0.1.0",
+      "tag": "@excitedjs/feishu-transport_v0.1.0",
+      "date": "Thu, 04 Jun 2026 05:00:52 GMT",
+      "comments": {
+        "minor": [
+          {
+            "comment": "Export the access-state persistence contract used by host channel gates."
+          }
+        ],
+        "none": [
+          {
+            "comment": "Add repository field so npm provenance validation passes on OIDC publish"
+          }
+        ]
+      }
+    },
+    {
       "version": "0.0.2",
       "tag": "@excitedjs/feishu-transport_v0.0.2",
       "date": "Sun, 31 May 2026 07:02:52 GMT",
