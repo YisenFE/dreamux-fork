@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 20:50:14 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 23:08:48 GMT and should not be manually modified.
+
+## 0.9.1
+Thu, 04 Jun 2026 23:08:48 GMT
+
+### Patches
+
+- Remove all synchronous blocking IO from package source (fs/promises + async child_process) and add a permanent ESLint gate (n/no-sync + import/syntax backstops via the shared @excitedjs/eslint-config) wired through rush lint, CI, and the pre-commit hook (issue #85)
 
 ## 0.9.0
 Thu, 04 Jun 2026 20:50:14 GMT

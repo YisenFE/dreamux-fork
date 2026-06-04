@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/feishu-transport
 
-This log was last generated on Thu, 04 Jun 2026 18:47:15 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 23:08:48 GMT and should not be manually modified.
+
+## 0.2.1
+Thu, 04 Jun 2026 23:08:48 GMT
+
+### Patches
+
+- Adopt the shared @excitedjs/eslint-config flat config and the synchronous-blocking-IO lint gate (issue #85); no runtime change
 
 ## 0.2.0
 Thu, 04 Jun 2026 18:47:15 GMT
