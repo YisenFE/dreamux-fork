@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 19:41:43 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 20:18:37 GMT and should not be manually modified.
+
+## 0.7.0
+Thu, 04 Jun 2026 20:18:37 GMT
+
+### Minor changes
+
+- Prefer a stable platform-aware system Node for the managed service (Homebrew on macOS, system paths on Linux) with fallback to the current Node, and add a non-fatal dreamux doctor advisory when the service Node is bound to a version manager.
 
 ## 0.6.2
 Thu, 04 Jun 2026 19:41:43 GMT

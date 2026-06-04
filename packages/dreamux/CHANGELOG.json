@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.7.0",
+      "tag": "@excitedjs/dreamux_v0.7.0",
+      "date": "Thu, 04 Jun 2026 20:18:37 GMT",
+      "comments": {
+        "minor": [
+          {
+            "comment": "Prefer a stable platform-aware system Node for the managed service (Homebrew on macOS, system paths on Linux) with fallback to the current Node, and add a non-fatal dreamux doctor advisory when the service Node is bound to a version manager."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.6.2",
       "tag": "@excitedjs/dreamux_v0.6.2",
       "date": "Thu, 04 Jun 2026 19:41:43 GMT",
