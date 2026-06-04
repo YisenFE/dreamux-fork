@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 05:00:52 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 07:44:14 GMT and should not be manually modified.
+
+## 0.3.1
+Thu, 04 Jun 2026 07:44:14 GMT
+
+### Patches
+
+- Fix managed service startup when Node is provided by nvm.
 
 ## 0.3.0
 Thu, 04 Jun 2026 05:00:52 GMT
