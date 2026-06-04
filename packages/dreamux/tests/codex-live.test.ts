@@ -24,6 +24,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+// eslint-disable-next-line no-restricted-imports -- live-Codex probe: a one-shot `execSync` reads the operator's interactive Codex auth/login state to decide whether the live model-gate case can run at all; it is setup, not the code under test, and must complete before the suite proceeds (issue #85 test-scope carve-out).
 import { execSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -446,7 +447,7 @@ describe('codex live integration', () => {
       // Onboard the live sender onto the global allow-user list so the folded
       // group messages are delivered (empty `allow_users` authorizes nobody
       // under the follow-user gate).
-      saveDispatcherAccess('live', {
+      await saveDispatcherAccess('live', {
         version: 2,
         allow_users: ['sender-live'],
         group: { policy: 'follow-user', allow_chats: [], require_mention: true },
