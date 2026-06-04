@@ -59,6 +59,11 @@ import {
   dispatcherCodexCwd,
   setRuntimeConfig,
 } from './runtime/paths.js';
+import {
+  createLogger,
+  loggerToLevelFn,
+  type DreamuxLogger,
+} from './runtime/logger.js';
 import { createAdminSocketServer, type AdminSocketServer } from './admin/socket.js';
 
 export const RECEIVED_REACTION_EMOJI = 'Get';
@@ -91,6 +96,18 @@ export interface ServerOptions {
   codexRestartBackoffBaseMs?: number;
   /** Codex child/WS restart backoff cap override (tests). */
   codexRestartBackoffMaxMs?: number;
+  /**
+   * Server-level logger (admin socket, dispatcher supervision, shutdown). When
+   * omitted, a stderr-only logger is used — the CLI entry point injects a
+   * file-backed one so tests stay filesystem-free.
+   */
+  logger?: DreamuxLogger;
+  /**
+   * Per-dispatcher channel logger factory (gate, inbound, outbound, introduce,
+   * dispatcher lifecycle). Defaults to a stderr-only logger per dispatcher; the
+   * CLI injects a factory that writes `logs/feishu-channel/<id>.log`.
+   */
+  channelLoggerFactory?: (dispatcherId: string) => DreamuxLogger;
 }
 
 export interface Repos {
@@ -102,6 +119,7 @@ interface DispatcherSlot {
   runtime: DispatcherRuntime;
   bot: FeishuBot;
   channelState: DispatcherChannelState;
+  log: DreamuxLogger;
 }
 
 interface DispatcherChannelState {
@@ -159,6 +177,8 @@ export class Server {
   private admin: AdminSocketServer | null = null;
   private shuttingDown = false;
   private readonly opts: ServerOptions;
+  private readonly log: DreamuxLogger;
+  private readonly channelLoggerFactory: (dispatcherId: string) => DreamuxLogger;
 
   constructor(opts: ServerOptions = {}) {
     this.opts = opts;
@@ -166,6 +186,12 @@ export class Server {
     // happens. paths.runtimeRoot / adminSocketPath / etc. consult this
     // snapshot for non-env defaults (env vars still win).
     setRuntimeConfig(opts.config ?? BUILT_IN_DEFAULTS);
+    // Default loggers are stderr-only (zero files opened) so tests that
+    // construct a Server without injecting a logger never touch ~/.dreamux.
+    this.log = opts.logger ?? createLogger({ name: 'server' });
+    this.channelLoggerFactory =
+      opts.channelLoggerFactory ??
+      ((id) => createLogger({ name: `channel/${id}` }));
     this.repos = {
       dispatchers: new DispatcherStore(opts.config ?? BUILT_IN_DEFAULTS),
     };
@@ -198,16 +224,19 @@ export class Server {
       this.opts.adminSocketPath ?? adminSocketPath(),
     );
     await this.admin.start();
-    console.error(`[server] admin socket listening at ${this.admin.socketPath}`);
+    this.log.info(
+      { admin_socket: this.admin.socketPath },
+      'admin socket listening',
+    );
 
     const rows = this.repos.dispatchers.listEnabled();
     for (const row of rows) {
       try {
         await this.startDispatcher(row.dispatcher_id);
       } catch (err) {
-        console.error(
-          `[server] dispatcher '${row.dispatcher_id}' failed to start:`,
-          err,
+        this.log.error(
+          { dispatcher_id: row.dispatcher_id, err: errInfo(err) },
+          'dispatcher failed to start',
         );
         // server keeps running; admin can inspect & retry via dispatcher.start
       }
@@ -265,6 +294,7 @@ export class Server {
       inboundReactions: new Map(),
       pendingReceivedReactionClears: new Set(),
     };
+    const channelLog = this.channelLoggerFactory(id);
 
     const runtime = new DispatcherRuntime(row, {
       dispatchers: this.repos.dispatchers,
@@ -277,6 +307,7 @@ export class Server {
       extraEnv: dispatcherConfig?.codex.extra_env ?? {},
       restartBackoffBaseMs: this.opts.codexRestartBackoffBaseMs,
       restartBackoffMaxMs: this.opts.codexRestartBackoffMaxMs,
+      log: loggerToLevelFn(channelLog),
     });
 
     try {
@@ -315,6 +346,14 @@ export class Server {
           ) {
             const peers = introducedPeers(event.mentions, bot.botOpenId);
             if (peers.length > 0) trustIntroducedBots(id, event.chatId, peers);
+            channelLog.info(
+              {
+                chat_id: event.chatId,
+                sender_id: event.senderId,
+                trusted_peers: peers.length,
+              },
+              'introduce consumed',
+            );
             return;
           }
 
@@ -331,13 +370,21 @@ export class Server {
           }, access);
           saveDispatcherAccess(id, gate.access);
           if (gate.warning !== null) {
-            console.error(
-              `[server] trust-domain warning for dispatcher '${id}': ${gate.warning}`,
+            channelLog.warn(
+              { chat_id: event.chatId, warning: gate.warning },
+              'trust-domain warning',
             );
           }
           if (gate.action === 'drop') {
-            console.error(
-              `[server] dropped feishu inbound for dispatcher '${id}': ${gate.reason}`,
+            channelLog.info(
+              {
+                chat_id: event.chatId,
+                chat_type: event.chatType,
+                sender_id: event.senderId,
+                message_id: event.messageId,
+                reason: gate.reason,
+              },
+              'feishu inbound dropped',
             );
             return;
           }
@@ -365,6 +412,7 @@ export class Server {
                 id,
                 bot,
                 channelState,
+                channelLog,
                 acceptedInput,
                 RECEIVED_REACTION_EMOJI,
                 'received',
@@ -372,6 +420,14 @@ export class Server {
             },
           });
           if (delivery.status === 'submitted') {
+            channelLog.info(
+              {
+                chat_id: event.chatId,
+                sender_id: event.senderId,
+                message_id: event.messageId,
+              },
+              'feishu inbound submitted',
+            );
             // Commit-after-notify: only clear the one-shot once the turn is
             // actually submitted, and only if the generation is still current.
             // `duplicate` / `stopped` / `failed` leave the context pending.
@@ -382,13 +438,19 @@ export class Server {
               id,
               bot,
               channelState,
+              channelLog,
               input,
               IN_PROGRESS_REACTION_EMOJI,
               'in_progress',
             );
           } else if (delivery.status === 'failed') {
-            console.error(
-              `[server] failed to submit Feishu inbound for dispatcher '${id}': ${delivery.error.message}`,
+            channelLog.error(
+              {
+                chat_id: event.chatId,
+                message_id: event.messageId,
+                err: errInfo(delivery.error),
+              },
+              'failed to submit feishu inbound',
             );
           }
         },
@@ -409,9 +471,14 @@ export class Server {
       throw err;
     }
 
-    this.slots.set(id, { row, runtime, bot, channelState });
-    console.error(
-      `[server] dispatcher '${id}' is ready (bot=${row.bot_app_id} cwd=${row.codex_cwd ?? dispatcherCodexCwd(id)})`,
+    this.slots.set(id, { row, runtime, bot, channelState, log: channelLog });
+    this.log.info(
+      {
+        dispatcher_id: id,
+        bot_app_id: row.bot_app_id,
+        cwd: row.codex_cwd ?? dispatcherCodexCwd(id),
+      },
+      'dispatcher ready',
     );
   }
 
@@ -422,12 +489,15 @@ export class Server {
     try {
       await slot.bot.close();
     } catch (err) {
-      console.error(`[server] error closing bot for '${id}':`, err);
+      slot.log.error({ dispatcher_id: id, err: errInfo(err) }, 'error closing bot');
     }
     try {
       await slot.runtime.stop();
     } catch (err) {
-      console.error(`[server] error stopping dispatcher '${id}':`, err);
+      slot.log.error(
+        { dispatcher_id: id, err: errInfo(err) },
+        'error stopping dispatcher',
+      );
     }
     this.slots.delete(id);
   }
@@ -438,21 +508,47 @@ export class Server {
 
   async replyFromMcp(input: ServerMcpReplyInput): Promise<{ message_ids: string[] }> {
     const slot = this.mustRunningSlot(input.dispatcherId);
-    const result = await slot.bot.send(
-      channelOutboundToFeishuTarget({
-        conversationId: input.chatId,
-        ...(input.messageId !== undefined ? { replyTo: input.messageId } : {}),
-        ...(input.mentionUserIds !== undefined
-          ? { mentionUsers: input.mentionUserIds }
-          : {}),
-      }),
-      input.text,
+    let result: { messageIds: string[] };
+    try {
+      result = await slot.bot.send(
+        channelOutboundToFeishuTarget({
+          conversationId: input.chatId,
+          ...(input.messageId !== undefined ? { replyTo: input.messageId } : {}),
+          ...(input.mentionUserIds !== undefined
+            ? { mentionUsers: input.mentionUserIds }
+            : {}),
+        }),
+        input.text,
+      );
+    } catch (err) {
+      // Persist the outbound failure so a daemon can later tell whether a model
+      // reply ever left the host. The message body (`input.text`) is omitted.
+      slot.log.error(
+        {
+          dispatcher_id: input.dispatcherId,
+          chat_id: input.chatId,
+          message_id: input.messageId,
+          err: errInfo(err),
+        },
+        'feishu reply failed',
+      );
+      throw err;
+    }
+    slot.log.info(
+      {
+        dispatcher_id: input.dispatcherId,
+        chat_id: input.chatId,
+        message_id: input.messageId,
+        message_ids: result.messageIds,
+      },
+      'feishu reply sent',
     );
     if (input.messageId !== undefined) {
       await clearInboundReaction(
         input.dispatcherId,
         slot.bot,
         slot.channelState,
+        slot.log,
         input.messageId,
       );
     }
@@ -461,7 +557,30 @@ export class Server {
 
   async reactFromMcp(input: ServerMcpReactInput): Promise<{ reaction_id: string }> {
     const slot = this.mustRunningSlot(input.dispatcherId);
-    const reactionId = await slot.bot.addReaction(input.messageId, input.emoji);
+    let reactionId: string;
+    try {
+      reactionId = await slot.bot.addReaction(input.messageId, input.emoji);
+    } catch (err) {
+      slot.log.error(
+        {
+          dispatcher_id: input.dispatcherId,
+          message_id: input.messageId,
+          emoji: input.emoji,
+          err: errInfo(err),
+        },
+        'feishu react failed',
+      );
+      throw err;
+    }
+    slot.log.info(
+      {
+        dispatcher_id: input.dispatcherId,
+        message_id: input.messageId,
+        emoji: input.emoji,
+        reaction_id: reactionId,
+      },
+      'feishu react sent',
+    );
     return { reaction_id: reactionId };
   }
 
@@ -513,7 +632,7 @@ export class Server {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
-    console.error('[server] shutting down...');
+    this.log.info('shutting down');
     for (const id of Array.from(this.slots.keys())) {
       await this.stopDispatcher(id);
     }
@@ -535,6 +654,7 @@ async function setInboundReaction(
   dispatcherId: string,
   bot: FeishuBot,
   channelState: DispatcherChannelState,
+  log: DreamuxLogger,
   input: InboundTurnInput,
   emoji: string,
   state: InboundReactionState,
@@ -553,15 +673,16 @@ async function setInboundReaction(
   try {
     reactionId = await bot.addReaction(messageId, emoji);
   } catch (err) {
-    console.error(
-      `[server] failed to add the ${state} reaction for dispatcher '${dispatcherId}':`,
-      err,
+    log.warn(
+      { dispatcher_id: dispatcherId, message_id: messageId, err: errInfo(err) },
+      `failed to add the ${state} reaction`,
     );
     return;
   }
   if (reactionId === '') {
-    console.error(
-      `[server] Feishu returned no reaction_id for the ${state} reaction in dispatcher '${dispatcherId}'`,
+    log.warn(
+      { dispatcher_id: dispatcherId, message_id: messageId },
+      `Feishu returned no reaction_id for the ${state} reaction`,
     );
     return;
   }
@@ -574,9 +695,9 @@ async function setInboundReaction(
     try {
       await bot.removeReaction(messageId, reactionId);
     } catch (err) {
-      console.error(
-        `[server] failed to clear the late ${state} reaction for dispatcher '${dispatcherId}' message '${messageId}':`,
-        err,
+      log.warn(
+        { dispatcher_id: dispatcherId, message_id: messageId, err: errInfo(err) },
+        `failed to clear the late ${state} reaction`,
       );
     }
     return;
@@ -592,9 +713,9 @@ async function setInboundReaction(
     try {
       await bot.removeReaction(messageId, previous.reactionId);
     } catch (err) {
-      console.error(
-        `[server] failed to replace the ${previous.state} reaction for dispatcher '${dispatcherId}' message '${messageId}':`,
-        err,
+      log.warn(
+        { dispatcher_id: dispatcherId, message_id: messageId, err: errInfo(err) },
+        `failed to replace the ${previous.state} reaction`,
       );
     }
   }
@@ -604,6 +725,7 @@ async function clearInboundReaction(
   dispatcherId: string,
   bot: FeishuBot,
   channelState: DispatcherChannelState,
+  log: DreamuxLogger,
   messageId: string,
 ): Promise<void> {
   rememberPendingReceivedReactionClear(channelState, messageId);
@@ -615,11 +737,21 @@ async function clearInboundReaction(
     await bot.removeReaction(messageId, reaction.reactionId);
     channelState.inboundReactions.delete(messageId);
   } catch (err) {
-    console.error(
-      `[server] failed to clear the ${reaction.state} reaction for dispatcher '${dispatcherId}' message '${messageId}':`,
-      err,
+    log.warn(
+      { dispatcher_id: dispatcherId, message_id: messageId, err: errInfo(err) },
+      `failed to clear the ${reaction.state} reaction`,
     );
   }
+}
+
+/** Compact, redaction-friendly error shape for structured log fields. */
+function errInfo(err: unknown): { message: string; stack?: string } {
+  if (err instanceof Error) {
+    return err.stack !== undefined
+      ? { message: err.message, stack: err.stack }
+      : { message: err.message };
+  }
+  return { message: String(err) };
 }
 
 function rememberPendingReceivedReactionClear(

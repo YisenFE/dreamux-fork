@@ -51,7 +51,35 @@ import {
   dispatcherSocketPath,
 } from '../src/runtime/paths.js';
 import { dreamuxBinPath } from '../src/runtime/package-bin.js';
+import { createLogger, type DreamuxLogger } from '../src/runtime/logger.js';
 import { startFakeCodex, type FakeCodex } from './fake-codex.js';
+import { Writable } from 'node:stream';
+
+/** Collect every JSON log line written to an injected logger destination. */
+function captureLogger(name: string): {
+  logger: DreamuxLogger;
+  lines: () => Array<Record<string, unknown>>;
+  text: () => string;
+} {
+  const chunks: string[] = [];
+  const sink = new Writable({
+    write(chunk, _enc, cb) {
+      chunks.push(chunk.toString());
+      cb();
+    },
+  });
+  const logger = createLogger({ name, destination: sink });
+  const text = (): string => chunks.join('');
+  return {
+    logger,
+    text,
+    lines: () =>
+      text()
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>),
+  };
+}
 
 class NoopCodexProcess extends CodexProcess {
   constructor(opts: CodexProcessOptions) {
@@ -80,11 +108,15 @@ function buildServer(opts: {
   codexClientFactory?: () => CodexWsClient;
   codexRestartBackoffBaseMs?: number;
   codexRestartBackoffMaxMs?: number;
+  channelLoggerFactory?: (dispatcherId: string) => DreamuxLogger;
 }): Server {
   return new Server({
     config: opts.config ?? BUILT_IN_DEFAULTS,
     adminSocketPath: join(opts.runtimeDir, 'admin.sock'),
     skipBotSecret: opts.skipBotSecret ?? true,
+    ...(opts.channelLoggerFactory !== undefined
+      ? { channelLoggerFactory: opts.channelLoggerFactory }
+      : {}),
     botFactory: (_row, secret) => {
       opts.capturedBotSecrets?.push(secret);
       return opts.bot;
@@ -1008,6 +1040,205 @@ describe('dreamux MVP smoke', () => {
     ]);
     await waitFor(() => fake.turnsHandled === 2);
     expect(bot.sentMessages).toEqual([]);
+  });
+
+  // Issue #70: a dropped inbound must be diagnosable (reason + ids) without
+  // leaking the message body into the persistent log.
+  it('logs gate drops with ids and reason but never the message body', async () => {
+    const capture = captureLogger('channel/flow');
+    const SECRET_BODY = 'PLEASE-DO-NOT-LOG-THIS-BODY';
+    server = buildServer({
+      runtimeDir,
+      fake,
+      bot,
+      channelLoggerFactory: () => capture.logger,
+    });
+    server.repos.dispatchers.create({
+      dispatcher_id: 'flow',
+      bot_app_id: 'app-smoke',
+      bot_secret_ref: 'env:UNUSED',
+    });
+    await server.start();
+
+    // A group message with no @-mention of our bot is dropped by the gate.
+    await bot.inject(
+      fakeInbound('chat-group-a', SECRET_BODY, 'msg-dropped', { mentions: [] }),
+    );
+    await sleep(60);
+
+    expect(fake.turnsHandled).toBe(0);
+    const dropLine = capture
+      .lines()
+      .find((line) => line['msg'] === 'feishu inbound dropped');
+    expect(dropLine).toBeDefined();
+    expect(dropLine).toMatchObject({
+      chat_id: 'chat-group-a',
+      message_id: 'msg-dropped',
+      reason: 'bot not mentioned',
+    });
+    // The body text must not appear anywhere in the persisted log.
+    expect(capture.text()).not.toContain(SECRET_BODY);
+  });
+
+  // Issue #70: a delivered inbound is logged (submitted) — still ids only.
+  it('logs accepted inbound as submitted without the message body', async () => {
+    const capture = captureLogger('channel/flow');
+    const SECRET_BODY = 'ACCEPTED-BODY-MUST-NOT-LEAK';
+    server = buildServer({
+      runtimeDir,
+      fake,
+      bot,
+      channelLoggerFactory: () => capture.logger,
+    });
+    server.repos.dispatchers.create({
+      dispatcher_id: 'flow',
+      bot_app_id: 'app-smoke',
+      bot_secret_ref: 'env:UNUSED',
+    });
+    await server.start();
+
+    await bot.inject(fakeInbound('chat-group-a', SECRET_BODY, 'msg-accepted'));
+    await waitFor(() => fake.turnsHandled === 1);
+
+    const submitted = capture
+      .lines()
+      .find((line) => line['msg'] === 'feishu inbound submitted');
+    expect(submitted).toMatchObject({
+      chat_id: 'chat-group-a',
+      message_id: 'msg-accepted',
+    });
+    expect(capture.text()).not.toContain(SECRET_BODY);
+  });
+
+  // Issue #70 (PR #75 review): outbound reply/react must be diagnosable —
+  // success and failure — without leaking the reply body. The admin layer
+  // turning a failure into a response does not replace a persistent log.
+  it('logs a successful outbound reply with ids but never the reply text', async () => {
+    const capture = captureLogger('channel/flow');
+    const REPLY_BODY = 'REPLY-BODY-MUST-NOT-LEAK';
+    server = buildServer({
+      runtimeDir,
+      fake,
+      bot,
+      channelLoggerFactory: () => capture.logger,
+    });
+    server.repos.dispatchers.create({
+      dispatcher_id: 'flow',
+      bot_app_id: 'app-smoke',
+      bot_secret_ref: 'env:UNUSED',
+    });
+    await server.start();
+
+    const result = await server.replyFromMcp({
+      dispatcherId: 'flow',
+      chatId: 'chat-group-a',
+      messageId: 'msg-reply',
+      text: REPLY_BODY,
+    });
+    expect(result.message_ids).toEqual(['message-fake-1']);
+
+    const sent = capture
+      .lines()
+      .find((line) => line['msg'] === 'feishu reply sent');
+    expect(sent).toMatchObject({
+      dispatcher_id: 'flow',
+      chat_id: 'chat-group-a',
+      message_id: 'msg-reply',
+      message_ids: ['message-fake-1'],
+    });
+    expect(capture.text()).not.toContain(REPLY_BODY);
+  });
+
+  it('logs a failed outbound reply with the error summary and rethrows (no body)', async () => {
+    const capture = captureLogger('channel/flow');
+    const REPLY_BODY = 'FAILED-REPLY-BODY-MUST-NOT-LEAK';
+    bot.setSendError(new Error('feishu send boom'));
+    server = buildServer({
+      runtimeDir,
+      fake,
+      bot,
+      channelLoggerFactory: () => capture.logger,
+    });
+    server.repos.dispatchers.create({
+      dispatcher_id: 'flow',
+      bot_app_id: 'app-smoke',
+      bot_secret_ref: 'env:UNUSED',
+    });
+    await server.start();
+
+    await expect(
+      server.replyFromMcp({
+        dispatcherId: 'flow',
+        chatId: 'chat-group-a',
+        messageId: 'msg-reply-fail',
+        text: REPLY_BODY,
+      }),
+    ).rejects.toThrow('feishu send boom');
+
+    const failed = capture
+      .lines()
+      .find((line) => line['msg'] === 'feishu reply failed');
+    expect(failed).toMatchObject({
+      dispatcher_id: 'flow',
+      chat_id: 'chat-group-a',
+      message_id: 'msg-reply-fail',
+    });
+    expect((failed?.['err'] as { message: string }).message).toBe(
+      'feishu send boom',
+    );
+    expect(capture.text()).not.toContain(REPLY_BODY);
+  });
+
+  it('logs outbound react success and failure with ids and emoji', async () => {
+    const capture = captureLogger('channel/flow');
+    server = buildServer({
+      runtimeDir,
+      fake,
+      bot,
+      channelLoggerFactory: () => capture.logger,
+    });
+    server.repos.dispatchers.create({
+      dispatcher_id: 'flow',
+      bot_app_id: 'app-smoke',
+      bot_secret_ref: 'env:UNUSED',
+    });
+    await server.start();
+
+    const ok = await server.reactFromMcp({
+      dispatcherId: 'flow',
+      messageId: 'msg-react',
+      emoji: 'THUMBSUP',
+    });
+    expect(ok.reaction_id).toBe('reaction-fake-1');
+    const sent = capture
+      .lines()
+      .find((line) => line['msg'] === 'feishu react sent');
+    expect(sent).toMatchObject({
+      dispatcher_id: 'flow',
+      message_id: 'msg-react',
+      emoji: 'THUMBSUP',
+      reaction_id: 'reaction-fake-1',
+    });
+
+    bot.setReactionError(new Error('feishu react boom'));
+    await expect(
+      server.reactFromMcp({
+        dispatcherId: 'flow',
+        messageId: 'msg-react-fail',
+        emoji: 'EYES',
+      }),
+    ).rejects.toThrow('feishu react boom');
+    const failed = capture
+      .lines()
+      .find((line) => line['msg'] === 'feishu react failed');
+    expect(failed).toMatchObject({
+      dispatcher_id: 'flow',
+      message_id: 'msg-react-fail',
+      emoji: 'EYES',
+    });
+    expect((failed?.['err'] as { message: string }).message).toBe(
+      'feishu react boom',
+    );
   });
 
   it('submits each pending inbound with turn/start while Codex folds active-turn input', async () => {
