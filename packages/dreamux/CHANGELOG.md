@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 17:12:55 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 17:58:38 GMT and should not be manually modified.
+
+## 0.6.0
+Thu, 04 Jun 2026 17:58:38 GMT
+
+### Minor changes
+
+- Add persistent structured file logging (pino) across server, Feishu channel, gate/drop/inbound/outbound/introduce, dispatcher runtime, and the feishu-mcp stdio shim; logs persist under ~/.dreamux/logs (issue #70).
 
 ## 0.5.0
 Thu, 04 Jun 2026 17:12:55 GMT
