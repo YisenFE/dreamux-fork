@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 07:44:14 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 13:15:17 GMT and should not be manually modified.
+
+## 0.3.2
+Thu, 04 Jun 2026 13:15:17 GMT
+
+### Patches
+
+- Submit accepted Feishu inbound with non-blocking turn/start delivery and three-state reactions.
 
 ## 0.3.1
 Thu, 04 Jun 2026 07:44:14 GMT
