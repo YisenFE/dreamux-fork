@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.9.0",
+      "tag": "@excitedjs/dreamux_v0.9.0",
+      "date": "Thu, 04 Jun 2026 20:50:14 GMT",
+      "comments": {
+        "minor": [
+          {
+            "comment": "Add daemon command group (install/uninstall/start/stop/restart), enable systemd linger so the user service starts at boot, and inject a restart-completed notice into resumed dispatchers after daemon restart --notify-resumed"
+          }
+        ]
+      }
+    },
+    {
       "version": "0.8.0",
       "tag": "@excitedjs/dreamux_v0.8.0",
       "date": "Thu, 04 Jun 2026 20:24:45 GMT",

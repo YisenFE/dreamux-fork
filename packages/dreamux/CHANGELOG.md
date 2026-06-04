@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 20:24:45 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 20:50:14 GMT and should not be manually modified.
+
+## 0.9.0
+Thu, 04 Jun 2026 20:50:14 GMT
+
+### Minor changes
+
+- Add daemon command group (install/uninstall/start/stop/restart), enable systemd linger so the user service starts at boot, and inject a restart-completed notice into resumed dispatchers after daemon restart --notify-resumed
 
 ## 0.8.0
 Thu, 04 Jun 2026 20:24:45 GMT
