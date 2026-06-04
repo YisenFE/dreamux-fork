@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 13:15:17 GMT and should not be manually modified.
+This log was last generated on Thu, 04 Jun 2026 14:09:37 GMT and should not be manually modified.
+
+## 0.3.3
+Thu, 04 Jun 2026 14:09:37 GMT
+
+### Patches
+
+- Fix Feishu inbound reaction emoji type values.
 
 ## 0.3.2
 Thu, 04 Jun 2026 13:15:17 GMT
