@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 14:06:54 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 15:34:49 GMT and should not be manually modified.
+
+## 0.10.0
+Fri, 05 Jun 2026 15:34:49 GMT
+
+### Minor changes
+
+- Add the `dreamux changelog` command (and `--json`) that prints the installed package's bundled CHANGELOG, and ship CHANGELOG.md/CHANGELOG.json in the package files. This is the upgrade-time information entry point for the 0.x fail-loud + rebuild policy (issue #98).
 
 ## 0.9.8
 Fri, 05 Jun 2026 14:06:54 GMT
