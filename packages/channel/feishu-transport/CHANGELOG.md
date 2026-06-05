@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/feishu-transport
 
-This log was last generated on Thu, 04 Jun 2026 23:08:48 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 05:30:23 GMT and should not be manually modified.
+
+## 0.2.2
+Fri, 05 Jun 2026 05:30:23 GMT
+
+### Patches
+
+- Expose structured inbound resources and a raw message-resource fetch seam for channel-owned attachment handling.
 
 ## 0.2.1
 Thu, 04 Jun 2026 23:08:48 GMT

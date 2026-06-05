@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 03:34:03 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 05:30:23 GMT and should not be manually modified.
+
+## 0.9.4
+Fri, 05 Jun 2026 05:30:23 GMT
+
+### Patches
+
+- Route Feishu inbound formatting through feishu-channel, including downloaded attachment paths and fallback resource references.
 
 ## 0.9.3
 Fri, 05 Jun 2026 03:34:03 GMT

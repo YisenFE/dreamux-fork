@@ -2,6 +2,18 @@
   "name": "@excitedjs/feishu-transport",
   "entries": [
     {
+      "version": "0.2.2",
+      "tag": "@excitedjs/feishu-transport_v0.2.2",
+      "date": "Fri, 05 Jun 2026 05:30:23 GMT",
+      "comments": {
+        "patch": [
+          {
+            "comment": "Expose structured inbound resources and a raw message-resource fetch seam for channel-owned attachment handling."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.2.1",
       "tag": "@excitedjs/feishu-transport_v0.2.1",
       "date": "Thu, 04 Jun 2026 23:08:48 GMT",
