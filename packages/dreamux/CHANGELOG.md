@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 08:05:04 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 12:14:20 GMT and should not be manually modified.
+
+## 0.9.7
+Fri, 05 Jun 2026 12:14:20 GMT
+
+### Patches
+
+- Restructure the bundled dispatcher skill into a router plus references, make the teammate engine a deliberate explicit choice instead of forcing codex, and add prompt-composition, router-posture, and inspect/resume workflow guidance.
 
 ## 0.9.6
 Fri, 05 Jun 2026 08:05:04 GMT

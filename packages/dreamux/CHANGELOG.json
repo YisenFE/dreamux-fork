@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.9.7",
+      "tag": "@excitedjs/dreamux_v0.9.7",
+      "date": "Fri, 05 Jun 2026 12:14:20 GMT",
+      "comments": {
+        "patch": [
+          {
+            "comment": "Restructure the bundled dispatcher skill into a router plus references, make the teammate engine a deliberate explicit choice instead of forcing codex, and add prompt-composition, router-posture, and inspect/resume workflow guidance."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.9.6",
       "tag": "@excitedjs/dreamux_v0.9.6",
       "date": "Fri, 05 Jun 2026 08:05:04 GMT",
