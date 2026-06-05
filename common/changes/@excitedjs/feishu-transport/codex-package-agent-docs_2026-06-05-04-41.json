@@ -1,0 +1,11 @@
+{
+  "changes": [
+    {
+      "comment": "Expose structured inbound resources and a raw message-resource fetch seam for channel-owned attachment handling.",
+      "type": "patch",
+      "packageName": "@excitedjs/feishu-transport"
+    }
+  ],
+  "packageName": "@excitedjs/feishu-transport",
+  "email": "053700@gmail.com"
+}
