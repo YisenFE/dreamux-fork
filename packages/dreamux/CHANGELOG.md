@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 15:34:49 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 16:16:45 GMT and should not be manually modified.
+
+## 0.11.0
+Fri, 05 Jun 2026 16:16:45 GMT
+
+### Minor changes
+
+- Unify persisted-file version policy (issue #98). BREAKING: dispatcher access.json is now v2-only; the legacy v1 shape (dm.allow_users + group.follow_users) is no longer auto-migrated and an unsupported/missing version fails loud. Rebuild: delete the dispatcher's access.json to return to the secure default (no one authorized), then recreate it as a v2 access.json with allow_users and group.policy (see the access.json section in the dreamux README) and restart; note that `dreamux onboard` does not restore access grants. status.json and restart-intent.json now warn-and-rebuild / warn-and-drop on incompatible, malformed, or invalid-field content instead of silently discarding or misreading; neither hard-fatals the server.
 
 ## 0.10.0
 Fri, 05 Jun 2026 15:34:49 GMT
