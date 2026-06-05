@@ -13,8 +13,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -47,7 +49,8 @@ import {
   dispatcherAppServerControlDir,
   dispatcherCodexCwd,
   dispatcherCodexHome,
-  dispatcherWorkspaceSkillPath,
+  bundledSkillDir,
+  dispatcherWorkspaceSkillDir,
   dispatcherSocketPath,
   restartIntentPath,
 } from '../src/runtime/paths.js';
@@ -232,11 +235,7 @@ function writeReadyDispatcherCodexHome(dispatcherId: string, dispatcherCwd?: str
   writeFileSync(join(dispatcherCodexHome(dispatcherId), 'auth.json'), '{}', {
     mode: 0o600,
   });
-  const skillPath = dispatcherWorkspaceSkillPath(
-    dispatcherCwd ?? dispatcherCodexCwd(dispatcherId),
-  );
-  mkdirSync(dirname(skillPath), { recursive: true });
-  writeFileSync(skillPath, '# test skill\n');
+  mkdirSync(dispatcherCwd ?? dispatcherCodexCwd(dispatcherId), { recursive: true });
 }
 
 function configWithDispatcher(
@@ -276,6 +275,7 @@ describe('dreamux MVP smoke', () => {
     runtimeDir = mkdtempSync(join(tmpdir(), 'dreamux-'));
     previousHome = process.env['HOME'];
     process.env['HOME'] = join(runtimeDir, 'home');
+    mkdirSync(dispatcherCodexCwd('flow'), { recursive: true });
     codexInputs = [];
     fake = await startFakeCodex({
       replyFor: captureAndEchoCodexInput(codexInputs),
@@ -368,6 +368,14 @@ describe('dreamux MVP smoke', () => {
     expect(capturedCodexOptions[0]?.env?.['PATH']).toContain('/bin');
     expect(capturedCodexOptions[0]?.socketPath).toBe(
       dispatcherSocketPath('flow'),
+    );
+    const dispatcherSkillDir = dispatcherWorkspaceSkillDir(
+      dispatcherCodexCwd('flow'),
+      'dispatcher',
+    );
+    expect(lstatSync(dispatcherSkillDir).isSymbolicLink()).toBe(true);
+    expect(realpathSync(dispatcherSkillDir)).toBe(
+      realpathSync(bundledSkillDir('dispatcher')),
     );
   });
 
