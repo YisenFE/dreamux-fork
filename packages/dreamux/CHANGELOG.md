@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 12:14:20 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 14:06:54 GMT and should not be manually modified.
+
+## 0.9.8
+Fri, 05 Jun 2026 14:06:54 GMT
+
+### Patches
+
+- Trusted peer-bot inbound now requires both a trusted sender open_id and an @-mention of this bot; introduce trusts only mention open_id (no union_id/user_id fallback); add diagnostic-only sender_union_id to inbound-drop logs (issue #102)
 
 ## 0.9.7
 Fri, 05 Jun 2026 12:14:20 GMT

@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/feishu-transport
 
-This log was last generated on Fri, 05 Jun 2026 05:30:23 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 14:06:54 GMT and should not be manually modified.
+
+## 0.2.3
+Fri, 05 Jun 2026 14:06:54 GMT
+
+### Patches
+
+- narrowMetaFromEvent surfaces a diagnostic sender_union_id from the inbound event; it is observability-only and never used for access matching (issue #102)
 
 ## 0.2.2
 Fri, 05 Jun 2026 05:30:23 GMT
