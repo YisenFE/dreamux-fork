@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.9.6",
+      "tag": "@excitedjs/dreamux_v0.9.6",
+      "date": "Fri, 05 Jun 2026 08:05:04 GMT",
+      "comments": {
+        "patch": [
+          {
+            "comment": "Fix the published npm install path by removing the ahead-of-use Feishu channel runtime dependency."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.9.5",
       "tag": "@excitedjs/dreamux_v0.9.5",
       "date": "Fri, 05 Jun 2026 05:41:43 GMT",

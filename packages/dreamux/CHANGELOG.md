@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 05:41:43 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 08:05:04 GMT and should not be manually modified.
+
+## 0.9.6
+Fri, 05 Jun 2026 08:05:04 GMT
+
+### Patches
+
+- Fix the published npm install path by removing the ahead-of-use Feishu channel runtime dependency.
 
 ## 0.9.5
 Fri, 05 Jun 2026 05:41:43 GMT
