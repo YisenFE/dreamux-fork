@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.9.2",
+      "tag": "@excitedjs/dreamux_v0.9.2",
+      "date": "Fri, 05 Jun 2026 02:47:01 GMT",
+      "comments": {
+        "patch": [
+          {
+            "comment": "Add a best-effort Feishu channel acknowledgement for authorized group /introduce commands."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.9.1",
       "tag": "@excitedjs/dreamux_v0.9.1",
       "date": "Thu, 04 Jun 2026 23:08:48 GMT",

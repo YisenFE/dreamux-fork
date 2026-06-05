@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Thu, 04 Jun 2026 23:08:48 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 02:47:01 GMT and should not be manually modified.
+
+## 0.9.2
+Fri, 05 Jun 2026 02:47:01 GMT
+
+### Patches
+
+- Add a best-effort Feishu channel acknowledgement for authorized group /introduce commands.
 
 ## 0.9.1
 Thu, 04 Jun 2026 23:08:48 GMT
