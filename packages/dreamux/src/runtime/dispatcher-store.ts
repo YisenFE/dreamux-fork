@@ -4,6 +4,16 @@ import { dirname } from 'node:path';
 import type { DispatcherConfig, DreamuxConfig } from './config.js';
 import { dispatcherStatusPath } from './paths.js';
 
+/**
+ * Warn sink for non-fatal recovery problems. `status.json` is server-owned,
+ * rebuildable recovery state (issue #98): an incompatible/corrupt file must not
+ * hard-fatal the server, but it must not be discarded silently either — the
+ * loss of a resumable thread_id is observable. Defaults to `console.warn` so
+ * direct callers and tests still surface it; the server passes its logger.
+ */
+export type StatusWarnLog = (message: string) => void;
+const defaultStatusWarn: StatusWarnLog = (message) => console.warn(message);
+
 export type DispatcherStatus =
   | 'declared'
   | 'starting'
@@ -70,10 +80,10 @@ export class DispatcherStore {
    * Restores thread_id / status / timestamps across restarts. The server calls
    * this once during `start()`, before any dispatcher is launched. Idempotent.
    */
-  async hydrate(): Promise<void> {
+  async hydrate(warn: StatusWarnLog = defaultStatusWarn): Promise<void> {
     const now = Date.now();
     for (const dispatcher of this.seedDispatchers) {
-      this.rows.set(dispatcher.id, await rowFromConfig(dispatcher, now));
+      this.rows.set(dispatcher.id, await rowFromConfig(dispatcher, now, warn));
     }
   }
 
@@ -241,8 +251,9 @@ function rowDefaults(config: DispatcherConfig, now: number): DispatcherRow {
 async function rowFromConfig(
   config: DispatcherConfig,
   now: number,
+  warn: StatusWarnLog,
 ): Promise<DispatcherRow> {
-  const status = await readStatusFile(config.id);
+  const status = await readStatusFile(config.id, warn);
   return {
     ...rowDefaults(config, now),
     thread_id: status?.thread_id ?? null,
@@ -274,30 +285,111 @@ function dispatcherCodexArgsJson(config: DispatcherConfig): string {
 
 async function readStatusFile(
   id: string,
+  warn: StatusWarnLog,
 ): Promise<DispatcherStatusFile | null> {
   const path = dispatcherStatusPath(id);
+  let text: string;
   try {
-    const raw = JSON.parse(
-      await readFile(path, 'utf8'),
-    ) as Partial<DispatcherStatusFile>;
-    if (raw.version !== 1 || raw.dispatcher_id !== id) return null;
-    return {
-      version: 1,
-      dispatcher_id: id,
-      thread_id: typeof raw.thread_id === 'string' ? raw.thread_id : null,
-      status: isDispatcherStatus(raw.status) ? raw.status : 'declared',
-      updated_at:
-        typeof raw.updated_at === 'number' && Number.isFinite(raw.updated_at)
-          ? raw.updated_at
-          : Date.now(),
-      last_started_at: numberOrNull(raw.last_started_at),
-      last_ready_at: numberOrNull(raw.last_ready_at),
-      last_error: stringOrNull(raw.last_error),
-      last_lost_thread_id: stringOrNull(raw.last_lost_thread_id),
-    };
-  } catch {
+    text = await readFile(path, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    // A readable file that fails for any other reason: rebuild, but say so.
+    warn(
+      `dispatcher '${id}' status file ${path} could not be read ` +
+        `(${errMessage(err)}); rebuilding dispatcher status from config defaults.`,
+    );
     return null;
   }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    warn(
+      `dispatcher '${id}' status file ${path} is not valid JSON ` +
+        `(${errMessage(err)}); rebuilding dispatcher status; ` +
+        'a saved thread_id may not be resumed.',
+    );
+    return null;
+  }
+
+  // Valid JSON that is not an object (e.g. `null`) would crash the field reads
+  // below; treat it like any other corrupt status file.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    warn(
+      `dispatcher '${id}' status file ${path} ignored: top-level must be an ` +
+        'object; rebuilding dispatcher status from config defaults; ' +
+        'a saved thread_id will not be resumed.',
+    );
+    return null;
+  }
+  const raw = parsed as Partial<DispatcherStatusFile>;
+
+  if (raw.version !== 1 || raw.dispatcher_id !== id) {
+    const reason =
+      raw.version !== 1
+        ? `unsupported version (found ${raw.version === undefined ? 'missing' : JSON.stringify(raw.version)}, expected 1)`
+        : `dispatcher id mismatch (file recorded ${JSON.stringify(raw.dispatcher_id)})`;
+    warn(
+      `dispatcher '${id}' status file ${path} ignored: ${reason}; ` +
+        'rebuilding dispatcher status from config defaults; ' +
+        'a saved thread_id will not be resumed.',
+    );
+    return null;
+  }
+
+  // A correctly-versioned, id-matched file can still carry malformed key
+  // fields. Silently coercing them (a numeric thread_id → null, a bad status →
+  // 'declared', a non-finite updated_at → now) would lose a resumable thread or
+  // change status without a trace. Treat a wrong-typed field as a corrupt file:
+  // warn + rebuild. An *absent* nullable field is benign and defaults to null;
+  // the required `status` / `updated_at` must be present and well-typed.
+  if (
+    !isNullableString(raw.thread_id) ||
+    !isDispatcherStatus(raw.status) ||
+    !(typeof raw.updated_at === 'number' && Number.isFinite(raw.updated_at)) ||
+    !isNullableNumber(raw.last_started_at) ||
+    !isNullableNumber(raw.last_ready_at) ||
+    !isNullableString(raw.last_error) ||
+    !isNullableString(raw.last_lost_thread_id)
+  ) {
+    warn(
+      `dispatcher '${id}' status file ${path} ignored: malformed v1 fields; ` +
+        'rebuilding dispatcher status from config defaults; ' +
+        'a saved thread_id will not be resumed.',
+    );
+    return null;
+  }
+
+  return {
+    version: 1,
+    dispatcher_id: id,
+    thread_id: raw.thread_id ?? null,
+    status: raw.status,
+    updated_at: raw.updated_at,
+    last_started_at: raw.last_started_at ?? null,
+    last_ready_at: raw.last_ready_at ?? null,
+    last_error: raw.last_error ?? null,
+    last_lost_thread_id: raw.last_lost_thread_id ?? null,
+  };
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Accept an absent (defaults to null), explicit null, or string field. */
+function isNullableString(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === 'string';
+}
+
+/** Accept an absent (defaults to null), explicit null, or finite-number field. */
+function isNullableNumber(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (typeof value === 'number' && Number.isFinite(value))
+  );
 }
 
 function isDispatcherStatus(value: unknown): value is DispatcherStatus {
@@ -307,14 +399,6 @@ function isDispatcherStatus(value: unknown): value is DispatcherStatus {
     value === 'degraded' ||
     value === 'stopping' ||
     value === 'stopped';
-}
-
-function numberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function stringOrNull(value: unknown): string | null {
-  return typeof value === 'string' ? value : null;
 }
 
 function normalizeEnabled(value: 0 | 1 | boolean): 0 | 1 {
