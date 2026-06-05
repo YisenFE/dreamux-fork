@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 02:47:01 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 03:34:03 GMT and should not be manually modified.
+
+## 0.9.3
+Fri, 05 Jun 2026 03:34:03 GMT
+
+### Patches
+
+- Fix group /introduce authorization to follow the group policy: under follow-user it now ignores allow_chats and gates only on allow_users, matching the delivery gate; block is denied explicitly (group_blocked); allowlist is unchanged.
 
 ## 0.9.2
 Fri, 05 Jun 2026 02:47:01 GMT
