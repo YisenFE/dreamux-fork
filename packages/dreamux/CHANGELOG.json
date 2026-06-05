@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.9.5",
+      "tag": "@excitedjs/dreamux_v0.9.5",
+      "date": "Fri, 05 Jun 2026 05:41:43 GMT",
+      "comments": {
+        "patch": [
+          {
+            "comment": "Bundle the dispatcher, team-dev-workflow, and dreamux-maintenance skills and install them as workspace-local symlinks for each dispatcher."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.9.4",
       "tag": "@excitedjs/dreamux_v0.9.4",
       "date": "Fri, 05 Jun 2026 05:30:23 GMT",

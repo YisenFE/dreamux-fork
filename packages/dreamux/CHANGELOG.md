@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 05:30:23 GMT and should not be manually modified.
+This log was last generated on Fri, 05 Jun 2026 05:41:43 GMT and should not be manually modified.
+
+## 0.9.5
+Fri, 05 Jun 2026 05:41:43 GMT
+
+### Patches
+
+- Bundle the dispatcher, team-dev-workflow, and dreamux-maintenance skills and install them as workspace-local symlinks for each dispatcher.
 
 ## 0.9.4
 Fri, 05 Jun 2026 05:30:23 GMT
