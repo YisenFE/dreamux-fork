@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Fri, 05 Jun 2026 16:51:01 GMT and should not be manually modified.
+This log was last generated on Sat, 06 Jun 2026 08:02:51 GMT and should not be manually modified.
+
+## 0.11.2
+Sat, 06 Jun 2026 08:02:51 GMT
+
+### Patches
+
+- Add a Dreamux dispatcher base prompt for Codex app-server thread start/resume and update @excitedjs/tm to 2.4.1
 
 ## 0.11.1
 Fri, 05 Jun 2026 16:51:01 GMT

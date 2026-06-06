@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.11.2",
+      "tag": "@excitedjs/dreamux_v0.11.2",
+      "date": "Sat, 06 Jun 2026 08:02:51 GMT",
+      "comments": {
+        "patch": [
+          {
+            "comment": "Add a Dreamux dispatcher base prompt for Codex app-server thread start/resume and update @excitedjs/tm to 2.4.1"
+          }
+        ]
+      }
+    },
+    {
       "version": "0.11.1",
       "tag": "@excitedjs/dreamux_v0.11.1",
       "date": "Fri, 05 Jun 2026 16:51:01 GMT",
