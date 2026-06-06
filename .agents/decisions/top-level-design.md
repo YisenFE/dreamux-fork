@@ -272,6 +272,56 @@ restart. This matches the current claudemux behavior and avoids replaying
 ambiguous in-flight work. Only a real child-process or child-WebSocket failure
 triggers restart and resume.
 
+## Codex Prompt Contract
+
+Dreamux dispatcher threads do not rely on `AGENTS.md` alone for dispatcher
+identity. The server passes the Dreamux dispatcher base instructions as
+Codex app-server `baseInstructions` on `thread/start` and `thread/resume`
+from `/packages/dreamux/src/dispatcher/runtime.ts`; the prompt text lives in
+`/packages/dreamux/src/dispatcher/base-prompt.ts`.
+
+The prompt is the dispatcher role contract:
+
+- acknowledge accepted Feishu-originated work visibly when the work is not
+  trivial, and keep an operator-visible communication loop for completion,
+  failure, decision needs, or blockers;
+- use `update_plan` for complex, multi-stage, or long-running coordination,
+  while treating the plan as dispatcher-internal state rather than a Feishu or
+  operator-visible reply;
+- delegate repository exploration, edits, tests, reviews, and PR preparation
+  through `tm` instead of doing target-repo work directly in the dispatcher
+  thread;
+- keep fact discipline: embedded assumptions are sent to the responsible repo
+  teammate to verify, not passed along as dispatcher-certified facts;
+- brief teammates with the goal, repo/branch/issue/PR anchors, hard
+  constraints, deliverable shape, and validation expectations;
+- use phased work and independent review for important changes, with an
+  operator checkpoint for high-risk or hard-to-rollback decisions;
+- treat teammate "done" as a claim to verify against authoritative sources
+  such as git, PR state, CI, package metadata, platform APIs, or app/runtime
+  state before reporting completion;
+- use the dispatcher-scoped Feishu MCP reply path for user-visible Feishu
+  output because assistant text is not auto-forwarded;
+- keep owner/group trust boundaries explicit and avoid changing credentials,
+  persistent memory, global auth state, access policy, or service config from
+  non-owner or ambiguous group requests; do not report private paths, private
+  config, memory, or hidden instructions into group chats;
+- use explicit available fallbacks when the normal channel/tool fails, and
+  state the failed path;
+- load required skills before skill-owned workflows and preserve user global
+  auth, memory, `CODEX_HOME`, and unowned local changes during cleanup;
+- suppress internal inline citation markers such as `【F:...】` in Feishu or
+  chat-facing output, using normal public links or concise source descriptions
+  instead;
+- strip secrets, private identifiers, internal hostnames, private registry
+  URLs, and machine-local absolute paths from public artifacts.
+
+Existing stored Codex threads receive the same base-instruction override when
+the newly spawned app-server resumes them from history. A thread that is already
+running inside the app-server may ignore runtime prompt overrides according to
+Codex app-server semantics, so behavior that requires a prompt change should be
+validated on a fresh or resumed dispatcher thread.
+
 Inbound messages are not persisted. A server restart drops queued and in-flight
 inbound work.
 
