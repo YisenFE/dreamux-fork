@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/dreamux
 
-This log was last generated on Sat, 06 Jun 2026 08:02:51 GMT and should not be manually modified.
+This log was last generated on Sat, 06 Jun 2026 09:58:26 GMT and should not be manually modified.
+
+## 0.11.3
+Sat, 06 Jun 2026 09:58:26 GMT
+
+### Patches
+
+- Fix team-dev-workflow skill frontmatter so Codex can parse it. The description had an unquoted colon-space ("dispatcher: adversarial ..."), which strict YAML reads as a nested mapping and rejects with "mapping values are not allowed here", making the bundled skill silently invisible in Codex. Reworded the description to drop the colon; the skill now lists and parses.
 
 ## 0.11.2
 Sat, 06 Jun 2026 08:02:51 GMT

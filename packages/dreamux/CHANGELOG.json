@@ -2,6 +2,18 @@
   "name": "@excitedjs/dreamux",
   "entries": [
     {
+      "version": "0.11.3",
+      "tag": "@excitedjs/dreamux_v0.11.3",
+      "date": "Sat, 06 Jun 2026 09:58:26 GMT",
+      "comments": {
+        "patch": [
+          {
+            "comment": "Fix team-dev-workflow skill frontmatter so Codex can parse it. The description had an unquoted colon-space (\"dispatcher: adversarial ...\"), which strict YAML reads as a nested mapping and rejects with \"mapping values are not allowed here\", making the bundled skill silently invisible in Codex. Reworded the description to drop the colon; the skill now lists and parses."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.11.2",
       "tag": "@excitedjs/dreamux_v0.11.2",
       "date": "Sat, 06 Jun 2026 08:02:51 GMT",
