@@ -1,6 +1,13 @@
 # Change Log - @excitedjs/feishu-transport
 
-This log was last generated on Fri, 05 Jun 2026 14:06:54 GMT and should not be manually modified.
+This log was last generated on Wed, 10 Jun 2026 07:24:34 GMT and should not be manually modified.
+
+## 0.3.0
+Wed, 10 Jun 2026 07:24:34 GMT
+
+### Minor changes
+
+- Add Feishu group creation and member-invite transport APIs used by Dreamux Team Mode create_group. The APIs fail loudly when the installed Feishu SDK/client does not expose the required chat methods.
 
 ## 0.2.3
 Fri, 05 Jun 2026 14:06:54 GMT

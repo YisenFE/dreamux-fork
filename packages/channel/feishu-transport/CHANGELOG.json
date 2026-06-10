@@ -2,6 +2,18 @@
   "name": "@excitedjs/feishu-transport",
   "entries": [
     {
+      "version": "0.3.0",
+      "tag": "@excitedjs/feishu-transport_v0.3.0",
+      "date": "Wed, 10 Jun 2026 07:24:34 GMT",
+      "comments": {
+        "minor": [
+          {
+            "comment": "Add Feishu group creation and member-invite transport APIs used by Dreamux Team Mode create_group. The APIs fail loudly when the installed Feishu SDK/client does not expose the required chat methods."
+          }
+        ]
+      }
+    },
+    {
       "version": "0.2.3",
       "tag": "@excitedjs/feishu-transport_v0.2.3",
       "date": "Fri, 05 Jun 2026 14:06:54 GMT",
