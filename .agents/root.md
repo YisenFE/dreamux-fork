@@ -6,15 +6,30 @@ when you need the *why* behind a piece of code or a decision history.
 
 ## What dreamux is
 
-A long-running Node process that hosts N **Dispatchers**. Each Dispatcher
-binds **1 Feishu channel + 1 Codex app-server child + 1 Codex thread + 1
-Feishu MCP endpoint**. All inbound chats for a dispatcher enter that
-dispatcher's single Codex thread; Feishu outbound is sent only when Codex
-calls the dispatcher-bound `feishu` MCP server. The current top-level
-architecture is:
+A long-running Node process that hosts N **Dispatchers**. Each Dispatcher binds
+one built-in Feishu bidirectional channel (`builtin:feishu`), one Agent Runtime
+provider (`builtin:codex`, `builtin:claude-code`, or an installed `npm:`
+Agent Runtime provider), and Dreamux-owned MCP surfaces for channel reply and
+TeamMate scheduling/retrieval. All inbound chats for a dispatcher enter that
+dispatcher's runtime context; channel outbound is sent only when the runtime
+calls the dispatcher-bound channel MCP server owned by the Feishu channel
+module. The current architecture is split between the original local-runtime
+baseline and the issue #135 realigned provider surfaces:
 
-- [Top-level design](decisions/top-level-design.md) — current source of truth
-  for runtime state, Feishu MCP, access gating, and config shape.
+- [Top-level design](decisions/top-level-design.md) — original MVP baseline;
+  still authoritative for unchanged local state/log ownership, Feishu access,
+  admin IPC, and process-local inbound limitations.
+- [Plugin and provider architecture](proposals/plugin-provider-architecture.md)
+  — issue #110 historical proposal for provider refs, Capability Registry,
+  Channel providers, Agent Runtime providers, and server-hosted TeamMate; the
+  current target is refined by the provider architecture realignment.
+- [Issue #110 Epic closure check](decisions/issue-110-epic-closure.md) —
+  closure checklist for what Phase 1 implemented and what remains deferred.
+- [Provider architecture realignment](decisions/provider-architecture-realignment.md)
+  — issue #135 target that refines #110/#126: one `AgentRuntime` for all roles,
+  Dispatcher Service as a real module, two plugin seams only (`agentRuntime` +
+  `channel`), registry demoted to a provider loader, Feishu pulled out of the
+  plugin seam.
 
 Background and older issue context:
 
@@ -68,6 +83,10 @@ Background and older issue context:
   reconciliation, access surface, message-format, CLI/diagnostic robustness);
   groups the deferred epic follow-ups + the #58 ultracode findings into the next
   workstream.
+- [`proposals/plugin-provider-architecture.md`](proposals/plugin-provider-architecture.md)
+  — issue #110 proposal for plugin/provider architecture. Its settled boundary
+  is recorded in the provider, channel, runtime, TeamMate, and compatibility
+  decisions.
 - [`proposals/feishu-bot-trust-context.md`](proposals/feishu-bot-trust-context.md)
   — issue #69 follow-up to #62: trusted-bot next-message context, a
   `list_chat_bots` query tool, and add-then-cancel reaction ordering
@@ -96,6 +115,7 @@ Background and older issue context:
 | change dispatcher `tm` packaging, PATH injection, or skill install location | [`decisions/dispatcher-tm-packaging.md`](decisions/dispatcher-tm-packaging.md) |
 | add/change a package, move source between packages | [`components/repo-structure.md`](components/repo-structure.md) |
 | modify runtime state, dispatcher lifecycle, Feishu MCP, access gating, or config shape | [`decisions/top-level-design.md`](decisions/top-level-design.md) |
+| verify issue #110 closure or provider Epic boundaries | [`decisions/issue-110-epic-closure.md`](decisions/issue-110-epic-closure.md) |
 | change Feishu inbound attachment downloads, cache, or Codex-facing message body | [`decisions/feishu-inbound-attachments.md`](decisions/feishu-inbound-attachments.md) |
 | browse decisions by topic | [`decisions/README.md`](decisions/README.md) |
 | understand why rush + pnpm | [`decisions/rush-pnpm-monorepo.md`](decisions/rush-pnpm-monorepo.md) |
@@ -103,6 +123,7 @@ Background and older issue context:
 | rename or restructure the public CLI / package | [`decisions/cli-and-package-naming.md`](decisions/cli-and-package-naming.md) |
 | implement issue #18 global bin / onboard / serve | [`proposals/global-bin-onboard-serve.md`](proposals/global-bin-onboard-serve.md) + [`decisions/global-bin-onboard-serve.md`](decisions/global-bin-onboard-serve.md) |
 | add / change a config key (`~/.dreamux/config.json`) | [`decisions/top-level-design.md`](decisions/top-level-design.md) first, then historical context in [`decisions/global-config-dir.md`](decisions/global-config-dir.md) |
+| change provider refs, Agent Runtime providers, channel plugin reservations, or server-hosted TeamMate | [`decisions/provider-architecture-realignment.md`](decisions/provider-architecture-realignment.md) + [`decisions/provider-references-and-capability-registry.md`](decisions/provider-references-and-capability-registry.md) |
 | touch the anti-leak guardrail (`.gitleaks.toml`, `.npmrc`, CI / hook) | [`decisions/anti-leak-guardrail.md`](decisions/anti-leak-guardrail.md) |
 | touch npm publishing / the release workflows | [`decisions/npm-release-oidc.md`](decisions/npm-release-oidc.md) |
 | change dispatcher inbound delivery, turn submission, or received-reaction timing | [`domains/non-blocking-dispatcher-inbound.md`](domains/non-blocking-dispatcher-inbound.md) + [`decisions/top-level-design.md`](decisions/top-level-design.md) + read the source |

@@ -13,11 +13,12 @@ import { dirname, join } from 'node:path';
 import { runUninstall } from '../src/onboard/uninstall.js';
 import type { CommandRunner } from '../src/onboard/types.js';
 import {
-  dispatcherWorkspaceSkillDirs,
   logsRoot,
   resetRuntimeConfig,
   stateRoot,
-} from '../src/runtime/paths.js';
+} from '../src/platform/paths.js';
+import { dispatcherWorkspaceSkillDirs } from '../src/agent-runtime/builtin/codex/paths.js';
+import { testSingleDispatcherFileObject } from './helpers/config.js';
 
 class FakeRunner implements CommandRunner {
   launchdLoaded = false;
@@ -68,25 +69,23 @@ describe('dreamux uninstall', () => {
     for (const skillDir of workspaceSkillDirs) {
       mkdirSync(skillDir, { recursive: true });
     }
-    writeFileSync(join(configDir, 'config.json'), JSON.stringify({
-      dispatchers: [
-        {
-          id: 'flow',
-          cwd: dispatcherCwd,
-          enabled: true,
-          feishu: {
-            app_id: 'app-test',
-            app_secret: 'secret-test',
-          },
-          codex: {
-            approval_policy: 'never',
-            sandbox_mode: 'workspace-write',
-            extra_args: [],
-            extra_env: {},
-          },
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        cwd: dispatcherCwd,
+        enabled: true,
+        feishu: {
+          app_id: 'app-test',
+          app_secret: 'secret-test',
         },
-      ],
-    }), { mode: 0o600 });
+        codex: {
+          approval_policy: 'never',
+          sandbox_mode: 'workspace-write',
+          extra_args: [],
+          extra_env: {},
+        },
+      }),
+    ), { mode: 0o600 });
     writeFileSync(join(logsRoot(), 'dreamux-server.log'), '');
     for (const skillDir of workspaceSkillDirs) {
       writeFileSync(join(skillDir, 'SKILL.md'), '# workspace skill\n');
@@ -221,17 +220,15 @@ describe('dreamux uninstall', () => {
       {
         name: 'world-readable JSON config',
         file: 'config.json',
-        content: JSON.stringify({
-          dispatchers: [
-            {
-              id: 'flow',
-              feishu: {
-                app_id: 'app-test',
-                app_secret: 'secret-test',
-              },
+        content: JSON.stringify(
+          testSingleDispatcherFileObject({
+            id: 'flow',
+            feishu: {
+              app_id: 'app-test',
+              app_secret: 'secret-test',
             },
-          ],
-        }),
+          }),
+        ),
         warning: /must be mode 0600/,
         mode: 0o644,
       },

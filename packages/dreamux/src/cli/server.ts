@@ -6,9 +6,10 @@
  *   dreamux serve --help
  *
  * Configuration sources:
- *   - ~/.dreamux/config.json — dispatcher declarations and channel secrets;
- *     each dispatcher's Codex settings (including its `bin`) live under
- *     dispatchers[].codex
+ *   - ~/.dreamux/config.json — named agents[], dispatcher declarations, and
+ *     channel secrets; each dispatcher's channel lives under
+ *     dispatchers[].channels[] and its runtime is a named agents[] entry
+ *     referenced via dispatchers[].agentRuntime
  *   - CODEX_HOST_CODEX_BIN — optional host-level override of the codex binary
  *     for every dispatcher; most operators never set it
  *   - built-in defaults compiled into the binary
@@ -19,18 +20,19 @@
 import { mkdir } from 'node:fs/promises';
 
 import { Server } from '../server.js';
-import { loadConfig } from '../runtime/config.js';
-import { createLogger } from '../runtime/logger.js';
+import { loadConfig } from '../config/config.js';
+import { createBuiltinProviderRegistry } from '../registry/index.js';
+import { createBuiltinAgentRuntimeProviderCatalog } from '../agent-runtime/index.js';
+import { createLogger } from '../platform/logger.js';
 import {
   adminSocketPath,
-  codexAppServerLogDir,
   feishuChannelLogDir,
   feishuChannelLogPath,
   feishuMcpLogDir,
   logsRoot,
   serverLogPath,
   stateRoot,
-} from '../runtime/paths.js';
+} from '../platform/paths.js';
 
 async function main(): Promise<void> {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
@@ -38,13 +40,25 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Compose the provider registry + builtin runtime catalog (with the real
+  // process factories) first, so the builtins carry runnable implementations
+  // before config parses agents[] (each agent's config is parsed through its
+  // provider's readConfig). config does not register builtins itself (that
+  // would re-form the #148 import cycle); the server owns this composition and
+  // hands the populated registry to loadConfig. Leaf entry points that do not
+  // build their own registry use loadConfigWithBuiltins instead.
+  const providerRegistry = createBuiltinProviderRegistry();
+  const agentRuntimeProviderCatalog = createBuiltinAgentRuntimeProviderCatalog({
+    registry: providerRegistry,
+    codex: {},
+  });
+
   // Load ~/.dreamux/config.json before anything else starts. Missing or invalid
   // config is a setup error; `dreamux serve` must not silently create defaults.
-  const { config, configFile } = await loadConfig();
+  const { config, configFile } = await loadConfig({ providerRegistry });
 
   await mkdir(stateRoot(), { recursive: true });
   await mkdir(logsRoot(), { recursive: true });
-  await mkdir(codexAppServerLogDir(), { recursive: true });
   await mkdir(feishuChannelLogDir(), { recursive: true });
   await mkdir(feishuMcpLogDir(), { recursive: true });
 
@@ -56,6 +70,8 @@ async function main(): Promise<void> {
 
   const server = new Server({
     config,
+    providerRegistry,
+    agentRuntimeProviderCatalog,
     logger,
     channelLoggerFactory: (id) =>
       createLogger({ name: `channel/${id}`, filePath: feishuChannelLogPath(id) }),
@@ -81,23 +97,29 @@ Usage:
 Global config:
   ~/.dreamux/config.json    Created by 'dreamux onboard'. Override with the
                             DREAMUX_CONFIG_DIR env var. Edit and restart to
-                            apply. Holds dispatcher declarations (including each
-                            dispatcher's Codex settings under
-                            dispatchers[].codex) and Feishu channel secrets.
+                            apply. Holds named agents[], dispatcher
+                            declarations (channels[] + agentRuntime), and
+                            Feishu channel secrets.
 
 Runtime data:
   ~/.dreamux/state/         server state, admin socket,
-                            and per-dispatcher Codex sockets.
-  ~/.dreamux/logs/          server, Feishu channel, and Codex app-server logs.
+                            per-dispatcher runtime sockets/config, and
+                            TeamMate ledgers.
+  ~/.dreamux/logs/          server, Feishu channel, Codex app-server, and MCP
+                            shim logs.
 
 Environment overrides:
   CODEX_HOST_CODEX_BIN      Optional host-level override of the codex binary for
-                            every dispatcher (normally unset; each dispatcher's
-                            dispatchers[].codex.bin is used, default "codex")
+                            every dispatcher (normally unset; each agent's
+                            agents[].config.bin is used, default "codex")
   DREAMUX_CONFIG_DIR        Overrides ~/.dreamux (where config.json lives)
 
 Dispatcher declarations:
   Edit ~/.dreamux/config.json dispatchers[] and restart dreamux serve.
+  Built-in Feishu channel: builtin:feishu.
+  AgentRuntime providers: builtin:codex, builtin:claude-code, or installed npm:<package>[#export].
+  Npm agentRuntime refs load through the same provider registry before config validation.
+  Subscription channel plugins are an interface-only reservation.
 `);
 }
 

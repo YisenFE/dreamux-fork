@@ -1,6 +1,11 @@
 # Top-level design
 
-- **Status:** Accepted
+- **Status:** Accepted for the original MVP; superseded for issue #110
+  providerized surfaces by [issue-110-epic-closure](issue-110-epic-closure.md),
+  [channel-provider](channel-provider.md), [agent-runtime-provider](agent-runtime-provider.md),
+  and [server-hosted-teammate](server-hosted-teammate.md). Still applies to
+  unchanged Feishu access, local state/log ownership, admin IPC, and
+  process-local inbound limitations unless a newer decision says otherwise.
 - **Date:** 2026-06-03
 - **Affects:** server runtime, dispatcher lifecycle, Feishu channel, Codex MCP, admin/outbound IPC, global config, state files, logs, CLI admin surface, workspace-local bundled skill ownership
 - **PR / Issue:** Local architecture clarification on 2026-06-03; supersedes the persistence and automatic-outbound parts of issue #2, the runtime-dir parts of `global-config-dir`, and loopback HTTP MCP as the default Feishu MCP transport
@@ -21,6 +26,36 @@ loopback HTTP MCP listener. Those pieces hide the product boundary and create
 wrong security defaults.
 
 This decision locks the MVP boundary.
+
+## Issue #110 Supersession
+
+This record remains historical context plus source of truth for the MVP pieces
+that issue #110 did not replace. It is not the full current architecture for the
+plugin/provider Epic; use [issue-110-epic-closure](issue-110-epic-closure.md)
+and the provider decisions for current providerized surfaces.
+
+Issue #110 supersedes these MVP assumptions:
+
+- one dispatcher structurally owns exactly one Feishu channel;
+- every dispatcher runtime is Codex;
+- the injected MCP surface is always a hard-coded Feishu MCP shim;
+- Dreamux never owns server-side TeamMate task state.
+
+The replacement decisions are:
+
+- [channel-provider](channel-provider.md) for channel lifecycle, channel-owned
+  MCP, and provider-owned reply/access semantics;
+- [agent-runtime-provider](agent-runtime-provider.md) for Codex and Claude Code
+  runtime providers;
+- [provider-references-and-capability-registry](provider-references-and-capability-registry.md)
+  for provider refs and process-local capability discovery;
+- [server-hosted-teammate](server-hosted-teammate.md) for the historical
+  Dispatcher Service-owned TeamMate scheduling phase;
+- [provider-architecture-realignment](provider-architecture-realignment.md)
+  for the current Dispatcher Service-owned, agent-centric TeamMate runtime and
+  state model;
+- [providerized-config-state-compatibility](providerized-config-state-compatibility.md)
+  for config v2 and issue #98 compatibility behavior.
 
 ## Architecture
 
@@ -76,37 +111,61 @@ state that the dispatcher shares one Codex context across those chats.
 It holds dispatcher declarations, local Feishu credentials, and the dispatcher
 cwd used for the workspace-local skill install.
 
-Example shape:
+Issue #110 supersedes the earlier Feishu/Codex-specific dispatcher keys with a
+providerized config v2 envelope. Issue #135 refines the runtime boundary: this
+phase wires one built-in `builtin:feishu` bidirectional channel and one
+Agent Runtime provider (`builtin:codex` or `builtin:claude-code`) per
+dispatcher. Feishu is not resolved through the provider registry; it is the
+core built-in conversational channel.
+
+Example shape (issue #148 normalizes runtime config into a top-level named
+`agents[]` array; a dispatcher references a runtime by id via `agentRuntime` and
+carries no runtime config block — channels stay inline):
 
 ```json
 {
+  "agents": [
+    {
+      "id": "codex",
+      "provider": "builtin:codex",
+      "config": {
+        "bin": "codex",
+        "approval_policy": "never",
+        "sandbox_mode": "workspace-write",
+        "extra_args": [],
+        "extra_env": { "EXAMPLE_FLAG": "1" },
+        "initialize_timeout_ms": 10000
+      }
+    }
+  ],
   "dispatchers": [
     {
       "id": "dispatcher-a",
       "cwd": "/path/to/workspace",
       "enabled": true,
-      "feishu": {
-        "app_id": "APP_ID",
-        "app_secret": "APP_SECRET"
-      },
-      "codex": {
-        "bin": "codex",
-        "approval_policy": "never",
-        "sandbox_mode": "workspace-write",
-        "extra_args": [],
-        "extra_env": {
-          "EXAMPLE_FLAG": "1"
-        },
-        "initialize_timeout_ms": 10000
-      }
+      "channels": [
+        {
+          "id": "primary",
+          "provider": "builtin:feishu",
+          "config": {
+            "app_id": "APP_ID",
+            "app_secret": "APP_SECRET"
+          }
+        }
+      ],
+      "agentRuntime": "codex"
     }
   ]
 }
 ```
 
-`dispatchers[].codex` is the only Codex configuration entry point — there is no
-top-level `codex` block. Every field is optional with a built-in default, so the
-whole `codex` object can be omitted:
+`agents[].config` is the only Codex configuration entry point while a
+`builtin:codex` agent is referenced — there is no top-level `codex` block, and an
+inline `dispatchers[].runtime` block is rejected loudly with rebuild guidance
+(issue #148). A dispatcher (and a TeamMate) selects a runtime by `agentRuntime`
+id; multiple dispatchers can share one agent, and one provider can have several
+named agent configs. Every Codex field is optional with a built-in default, so
+an agent's `config` object can be omitted entirely:
 
 | Field | Default | Notes |
 | --- | --- | --- |
@@ -117,10 +176,11 @@ whole `codex` object can be omitted:
 | `extra_env` | `{}` | merged over the dispatcher's process env |
 | `initialize_timeout_ms` | `10000` | handshake timeout (positive integer) |
 
-`feishu.app_id` is a unique dispatcher identity. Across all declared
-dispatchers, including disabled dispatchers, an app id must map to exactly one
-dispatcher. `dreamux serve`, `doctor`, and `onboard` must fail or report a
-blocking error when two dispatchers use the same app id.
+`channels[].config.app_id` for `builtin:feishu` is a unique dispatcher
+identity. Across all declared dispatchers, including disabled dispatchers, an
+app id must map to exactly one dispatcher. `dreamux serve`, `doctor`, and
+`onboard` must fail or report a blocking error when two dispatchers use the
+same app id.
 
 Rules:
 
@@ -138,15 +198,18 @@ Rules:
   logs.
 - A top-level `codex` block is **not** supported: it is rejected loudly on
   load with migration guidance. All Codex settings are per-dispatcher.
-- `codex.bin` (default `"codex"`) is that dispatcher's Codex binary path. The
-  `CODEX_HOST_CODEX_BIN` env var is an optional host-level override that wins
-  over `codex.bin` for every dispatcher; onboard does not bake it into the
-  managed-service unit (the unit `PATH` carries the codex directory instead).
-- `codex.initialize_timeout_ms` (default `10000`) is that dispatcher's
+- Pre-providerized `dispatchers[].feishu` and `dispatchers[].codex` blocks are
+  **not** silently migrated. They fail loudly with v2 rebuild guidance.
+- `runtime.config.bin` (default `"codex"`) is that dispatcher's Codex binary
+  path. The `CODEX_HOST_CODEX_BIN` env var is an optional host-level override
+  that wins over `runtime.config.bin` for every dispatcher; onboard does not
+  bake it into the managed-service unit (the unit `PATH` carries the codex
+  directory instead).
+- `runtime.config.initialize_timeout_ms` (default `10000`) is that dispatcher's
   Codex initialize-handshake timeout.
-- `codex.extra_env` is merged over the server process environment before
-  starting that dispatcher's Codex app-server.
-- `codex.extra_args` is passed to `codex app-server`.
+- `runtime.config.extra_env` is merged over the server process environment
+  before starting that dispatcher's Codex app-server.
+- `runtime.config.extra_args` is passed to `codex app-server`.
 - dreamux-generated MCP config overrides are injected last, so the dispatcher
   always receives the Feishu MCP server for its own channel.
 - dreamux follows Codex's own `~/.codex/` home for Codex auth, config, and
@@ -171,6 +234,20 @@ State and logs are server-owned. They are not operator-editable config.
       access.json
       chat-bots.json
       codex.sock
+      teammate/
+        identities/
+          <name>.json          one TeamMate identity/checkpoint per file
+        history/
+          <name>.jsonl         forward-only TeamMate lifecycle history
+        runtime/
+          <name>/              runtime-private socket/config state
+        worktrees/
+          <slug>/              Dreamux-managed TeamMate/Team worktrees
+      team/
+        records/
+          <team-id>.json        Team lifecycle record and TeamLeader pointer
+        ledger/
+          <team-id>.jsonl       append-only Team lifecycle ledger
   logs/
     dreamux-server.log
     daemon.stdout.log          when run as a daemon (onboard service redirect)
@@ -179,9 +256,15 @@ State and logs are server-owned. They are not operator-editable config.
       dispatcher-a.log
     feishu-mcp/
       dispatcher-a.log         feishu-mcp stdio shim diagnostics (issue #70)
+    teammate-mcp/
+      dispatcher-a.log         TeamMate MCP stdio shim diagnostics
     codex-app-server/
       dispatcher-a.log         Codex app-server child stdout
       dispatcher-a.stderr.log  Codex app-server child stderr
+      teammate/
+        dispatcher-a/
+          <name>.log           TeamMate Codex runtime stdout
+          <name>.stderr.log    TeamMate Codex runtime stderr
 ```
 
 Host logging (issue #70): `dreamux serve`, the Feishu channel (gate
@@ -265,10 +348,18 @@ server-owned discovery state, safe to delete; it holds no credentials.
 dispatcher. It is not the Feishu MCP transport. The Feishu MCP default transport
 is stdio.
 
-Socket path builders must live in `src/runtime/paths.ts`. They must enforce a
-short Unix socket path budget before spawning child processes. Dispatcher ids are
-validated as stable path segments and length-checked so derived `admin.sock` and
-`codex.sock` paths stay within Linux and macOS `sun_path` limits.
+Socket path builders must live in `src/platform/paths.ts` (neutral) and each
+builtin's own `paths.ts` (runtime-specific, per the issue #143 de-leak). They
+must enforce a short Unix socket path budget before spawning child processes.
+Dispatcher ids are validated as stable path segments and length-checked so
+derived `admin.sock` and `codex.sock` paths stay within Linux and macOS
+`sun_path` limits. When a Codex socket's descriptive in-state path exceeds the
+budget (deep `$HOME`, long teammate runtime roots such as
+`state/<dispatcher>/teammate/runtime/<name>/`), the builtin falls back to a
+short deterministic digest-named socket under a private per-user runtime root —
+`XDG_RUNTIME_DIR`, or a non-shared os tmpdir such as macOS's per-user
+`$TMPDIR`. The shared `/tmp` is never used for sockets (see the global-bin
+decision record); with no private root available the start still fails loudly.
 
 There is no `runtime_dir`, no SQLite database, no persisted inbound message
 queue, and no persisted reaction ledger. `stateRoot()` is the single state root;
@@ -302,7 +393,7 @@ triggers restart and resume.
 Dreamux dispatcher threads do not rely on `AGENTS.md` alone for dispatcher
 identity. The server passes the Dreamux dispatcher base instructions as
 Codex app-server `baseInstructions` on `thread/start` and `thread/resume`
-from `/packages/dreamux/src/dispatcher/runtime.ts`; the prompt text lives in
+from `/packages/dreamux/src/agent-runtime/codex-runtime.ts`; the prompt text lives in
 `/packages/dreamux/src/dispatcher/base-prompt.ts`.
 
 The prompt is the dispatcher role contract:
@@ -499,6 +590,67 @@ The MVP MCP tool surface is:
 
 Reply failures return an MCP tool error and are logged. There is no persisted
 outbound retry queue.
+
+## TeamMate MCP
+
+Issue #135 realigns the Dispatcher Service-owned TeamMate MCP around named
+agents. The shim is also a per-dispatcher stdio process:
+
+```text
+<dreamux-bin> teammate-mcp --dispatcher dispatcher-a --caller dispatcher
+```
+
+The dispatcher-facing tools are `spawn`, `send`, `close`, `history`,
+`history_events`, `list`, `status`, `last`, `ctx`, and `get_capabilities`
+(issue #155 removed the `resume` verb; `send` reopens a closed teammate from its
+checkpoint). `history` is the bounded session ledger by default; `history_events`
+is the raw forward-only event timeline for one TeamMate. Lifecycle
+tools forward
+to `dreamux serve` over the local admin socket; the server owns the
+per-dispatcher TeamMate identities, runtime checkpoints, session ledger, and raw
+event history under `state/<dispatcher-id>/teammate/`. Issue #169 made `spawn.cwd`
+required and added optional managed worktree isolation:
+`spawn({ name, prompt, cwd, worktree?, agent_runtime? })`. A reuse-cwd teammate
+runs in the caller-supplied `cwd`; a managed teammate runs only in its prepared
+worktree and persists source cwd/repo, runtime cwd, worktree branch/base ref,
+cleanup policy/state, and a default dispatcher `owner` field on the identity.
+Old identities without owner/worktree metadata read as dispatcher-owned
+reuse-cwd records until the next lifecycle mutation rewrites them. A caller
+marked as `teammate` does not receive lifecycle tools, so TeamMates cannot
+recursively spawn or close TeamMates.
+
+## Team Mode Core
+
+Issue #171 starts Team Mode. Dispatcher runtimes receive a `team` MCP server for
+dispatcher-only team lifecycle: `create`, `list`, `status`, `ledger`,
+`bind_channel`, `transfer_channel_back`, and `dissolve`. `create` requires
+`repo_cwd` and `leader_agent_runtime`; Dreamux does not infer a default
+TeamLeader runtime. A TeamLeader is a TeamMate identity with `role:
+"team_leader"` and dispatcher owner. Team-owned members are normal TeamMate
+identities with `role: "team_member"` and `owner.kind: "team"`.
+
+The same `teammate` MCP surface is caller-scoped by server-derived principal,
+not by tool arguments. Dispatcher callers see dispatcher-owned TeamMates and
+TeamLeaders. TeamLeader callers see only members owned by their own team and
+spawn members into the shared Team managed worktree. Ordinary TeamMate callers
+still do not receive lifecycle tools.
+
+Channel binding is persisted under `state/<dispatcher-id>/team/` and is scoped
+to group chats only. Bound Feishu group inbound is gated and formatted by the
+Feishu channel exactly as before, then routed by Dispatcher Service to the
+owning TeamLeader runtime. Unbound and P2P inbound still route to the
+dispatcher. `transfer_channel_back` deactivates a binding; `dissolve` transfers
+active bindings back before closing the team. TeamLeader Feishu MCP calls carry
+their server-derived team principal and can reply/react only in bound team
+channels; the dispatcher keeps the global Feishu management surface.
+
+From a P2P control channel, `team.create_group` can create a Team, ask the
+shared dispatcher Feishu bot to create a new group and invite the requester /
+specified peers, then bind that new group to the TeamLeader through the same
+ChannelBindingStore path. The source P2P channel is never bound or transferred:
+it remains the dispatcher control plane. TeamLeaders do not get independent
+Feishu identities or credentials; they are internal AgentRuntime roles behind
+the dispatcher-owned shared bot.
 
 ## Reaction Ownership
 

@@ -1,25 +1,27 @@
 import { access } from 'node:fs/promises';
 
-import { codexArgsToCli, parseCodexArgs } from '../runtime/codex-args.js';
+import { codexArgsToCli, parseCodexArgs } from '../agent-runtime/builtin/codex/args.js';
 import {
   assertNoLegacyTomlOnly,
   globalConfigFile,
-  loadConfig,
   stringifyConfig,
-} from '../runtime/config.js';
+} from '../config/config.js';
+import { loadConfigWithBuiltins } from '../agent-runtime/load-config.js';
+import {
+  logsRoot,
+  setRuntimeConfig,
+  stateRoot,
+} from '../platform/paths.js';
 import {
   dispatcherAppServerControlDir,
   dispatcherCodexHome,
   dispatcherWorkspaceCodexSkillsDir,
-  logsRoot,
-  setRuntimeConfig,
-  stateRoot,
-} from '../runtime/paths.js';
+} from '../agent-runtime/builtin/codex/paths.js';
 import {
   dispatcherCodexHomeDoctorContext,
   validateDispatcherCodexHome,
   type DispatcherCodexHomeDoctorResult,
-} from '../runtime/dispatcher-codex-home.js';
+} from '../agent-runtime/builtin/codex/codex-home.js';
 import { ExecaCommandRunner } from './commands.js';
 import {
   dispatcherCodexArgsJson,
@@ -35,7 +37,9 @@ import {
   installUserService,
   managedServiceEnvironment,
   resolveServiceExecutable,
+  selectServiceClaudeBin,
   selectServiceNodeBin,
+  tryResolveServiceExecutable,
   type ServiceNodeProbe,
   validateManagedServiceLaunch,
 } from './service.js';
@@ -69,9 +73,10 @@ export async function runOnboard(
   const configPath = globalConfigFile({ configDir: answers.configDir });
   const existingConfig = await readExistingDreamuxConfig(answers.configDir);
   const dreamuxConfig = dreamuxConfigFromAnswers(answers, existingConfig);
-  // answers.codexBin (onboard prompt / --codex-bin) is persisted into the new
-  // dispatcher's dispatchers[].codex.bin and used to seed the managed-service
-  // PATH so the unit can resolve codex; it is not pinned as an env override.
+  // answers.codexBin (onboard prompt / --codex-bin) is persisted into the
+  // dispatcher's referenced agents[] entry (agents[].config.bin) and used to
+  // seed the managed-service PATH so the unit can resolve codex; it is not
+  // pinned as an env override.
   const serviceCodexBin = answers.registerService && !answers.dryRun
     ? await resolveServiceExecutable(answers.codexBin, env)
     : answers.codexBin;
@@ -83,10 +88,18 @@ export async function runOnboard(
         probe: options.nodeProbe,
       })
     : process.execPath;
+  // Best-effort: locate Claude Code so the unit PATH resolves `claude` for
+  // server-hosted builtin:claude-code workers (issue #126 PR8). Absent install
+  // → omit; onboard still completes for codex-only setups.
+  const serviceClaudeBin =
+    answers.registerService && !answers.dryRun
+      ? await tryResolveServiceExecutable(selectServiceClaudeBin(env), env)
+      : null;
   const effectiveAnswers = {
     ...answers,
     codexBin: serviceCodexBin,
     nodeBin: serviceNodeBin,
+    ...(serviceClaudeBin !== null ? { claudeBin: serviceClaudeBin } : {}),
   };
   setRuntimeConfig(dreamuxConfig);
 
@@ -180,7 +193,7 @@ async function readExistingDreamuxConfig(configDir: string) {
   const configPath = globalConfigFile({ configDir });
   await assertNoLegacyTomlOnly({ configDir });
   if (!(await pathExists(configPath))) return undefined;
-  return (await loadConfig({ configDir })).config;
+  return (await loadConfigWithBuiltins({ configDir })).config;
 }
 
 /** Async existence probe — the fs/promises replacement for `existsSync`. */

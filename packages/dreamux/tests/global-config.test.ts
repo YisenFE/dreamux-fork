@@ -16,6 +16,8 @@ import {
   DEFAULT_APPROVAL_POLICY,
   DEFAULT_CONFIG_JSON,
   DEFAULT_SANDBOX_MODE,
+  dispatcherCodexConfig,
+  dispatcherFeishuConfig,
   expandHome,
   globalConfigDir,
   globalConfigFile,
@@ -23,21 +25,65 @@ import {
   loadOrInitConfig,
   redactConfigForDisplay,
   stringifyConfig,
-} from '../src/runtime/config.js';
+} from '../src/config/config.js';
+import {
+  loadConfigWithBuiltins,
+  loadOrInitConfigWithBuiltins,
+} from '../src/agent-runtime/load-config.js';
 import {
   adminSocketPath,
   resetRuntimeConfig,
   serverJsonPath,
   setRuntimeConfig,
   stateRoot,
-} from '../src/runtime/paths.js';
-import { codexArgsToCli, parseCodexArgs } from '../src/runtime/codex-args.js';
+} from '../src/platform/paths.js';
+import { codexArgsToCli, parseCodexArgs } from '../src/agent-runtime/builtin/codex/args.js';
+import {
+  createBuiltinProviderRegistry,
+  parseProviderRef,
+} from '../src/registry/index.js';
+import type {
+  AgentRuntimeCapabilities,
+  ExternalAgentRuntimeProviderFactory,
+} from '../src/agent-runtime/index.js';
+import {
+  testDispatcherConfig,
+  testConfigFileObject,
+  testSingleDispatcherFileObject,
+} from './helpers/config.js';
 
 function writeConfigObjectAt(configDir: string, value: unknown): void {
   writeFileSync(globalConfigFile({ configDir }), JSON.stringify(value), {
     mode: 0o600,
   });
 }
+
+const EXTERNAL_RUNTIME_CAPABILITIES: AgentRuntimeCapabilities = {
+  resume: { supported: true, checkpoint: 'externalSession' },
+  steer: { supported: false },
+  events: { kind: 'synthesized' },
+  last: { supported: true },
+  context: { supported: false },
+  teammateCompletion: [],
+};
+
+const externalRuntimeFactory: ExternalAgentRuntimeProviderFactory = ({
+  ref,
+  descriptor,
+}) => ({
+  ref,
+  descriptor,
+  getCapabilities: () => EXTERNAL_RUNTIME_CAPABILITIES,
+  readConfig(rawConfig) {
+    return {
+      ...rawConfig,
+      parsed_by_provider: true,
+    };
+  },
+  createRuntime() {
+    throw new Error('external runtime config test does not create a runtime');
+  },
+});
 
 describe('global config (~/.dreamux/config.json)', () => {
   let configDir: string;
@@ -73,6 +119,23 @@ describe('global config (~/.dreamux/config.json)', () => {
     writeFileSync(file, content, { mode });
   }
 
+  it('config round-trips through stringifyConfig idempotently (#148)', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        cwd: join(configDir, 'flow-cwd'),
+        enabled: true,
+        feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
+      }),
+    );
+    const c1 = (await loadConfigWithBuiltins({ configDir })).config;
+    // load -> stringify -> load must be a fixed point: the in-memory config
+    // serialised back to the file shape and reloaded yields the same config.
+    writeConfigText(globalConfigFile({ configDir }), stringifyConfig(c1));
+    const c2 = (await loadConfigWithBuiltins({ configDir })).config;
+    expect(c2).toEqual(c1);
+  });
+
   it('first boot creates the config dir and JSON file', async () => {
     expect(existsSync(join(configDir, 'config.json'))).toBe(false);
 
@@ -83,51 +146,77 @@ describe('global config (~/.dreamux/config.json)', () => {
     expect(createdOnThisBoot).toBe(true);
     expect(configFile).toBe(join(configDir, 'config.json'));
     expect(readFileSync(configFile, 'utf8')).toBe(DEFAULT_CONFIG_JSON);
-    // The default config is dispatchers-only: there is no top-level codex block.
-    expect(config).toEqual({ dispatchers: [] });
+    // The default config is empty agents + dispatchers: there is no top-level
+    // codex block, and no inline dispatcher runtime.
+    expect(config).toEqual({ agents: {}, dispatchers: [] });
     expect(JSON.parse(readFileSync(configFile, 'utf8'))).not.toHaveProperty(
       'codex',
     );
+    // First boot writes the on-disk file shape (agents[] array), which the
+    // parser then accepts on the next boot.
+    expect(JSON.parse(readFileSync(configFile, 'utf8'))).toEqual({
+      agents: [],
+      dispatchers: [],
+    });
   });
 
   it('second boot reads the existing JSON file and does not overwrite it', async () => {
     const file = globalConfigFile({ configDir });
-    const original = stringifyConfig({
-      dispatchers: [
-        {
-          id: 'flow',
-          cwd: '/workspace/flow',
-          enabled: true,
-          feishu: {
-            app_id: 'app-test',
-            app_secret: 'secret-test',
-          },
-          codex: {
-            approval_policy: 'auto',
-            sandbox_mode: 'danger-full-access',
-            extra_args: ['--profile', 'flow'],
-            extra_env: {},
-          },
+    const original = `${JSON.stringify(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        cwd: '/workspace/flow',
+        enabled: true,
+        feishu: {
+          app_id: 'app-test',
+          app_secret: 'secret-test',
         },
-      ],
-    });
+        codex: {
+          approval_policy: 'auto',
+          sandbox_mode: 'danger-full-access',
+          extra_args: ['--profile', 'flow'],
+          extra_env: {},
+        },
+      }),
+      null,
+      2,
+    )}\n`;
     writeConfigText(file, original);
 
-    const { config, createdOnThisBoot } = await loadOrInitConfig({ configDir });
+    const { config, createdOnThisBoot } = await loadOrInitConfigWithBuiltins({ configDir });
     expect(createdOnThisBoot).toBe(false);
-    expect(config.dispatchers[0]).toMatchObject({
-      id: 'flow',
-      cwd: '/workspace/flow',
-      enabled: true,
-      feishu: {
-        app_id: 'app-test',
-        app_secret: 'secret-test',
-      },
-      codex: {
+    expect(config.agents['flow']).toMatchObject({
+      provider: 'builtin:codex',
+      config: {
         approval_policy: 'auto',
         sandbox_mode: 'danger-full-access',
         extra_args: ['--profile', 'flow'],
         extra_env: {},
+      },
+    });
+    expect(config.dispatchers[0]).toMatchObject({
+      id: 'flow',
+      cwd: '/workspace/flow',
+      enabled: true,
+      channels: [
+        {
+          id: 'primary',
+          provider: 'builtin:feishu',
+          config: {
+            app_id: 'app-test',
+            app_secret: 'secret-test',
+          },
+        },
+      ],
+      agentRuntime: 'flow',
+      runtime: {
+        provider: 'builtin:codex',
+        config: {
+          approval_policy: 'auto',
+          sandbox_mode: 'danger-full-access',
+          extra_args: ['--profile', 'flow'],
+          extra_env: {},
+        },
       },
     });
     expect(readFileSync(file, 'utf8')).toBe(original);
@@ -165,10 +254,16 @@ describe('global config (~/.dreamux/config.json)', () => {
       dispatchers: [
         {
           id: 'flow',
-          feishu: {
-            app_id: 'app-flow',
-            app_secret: 'secret-flow',
-          },
+          channels: [
+            {
+              id: 'primary',
+              provider: 'builtin:feishu',
+              config: {
+                app_id: 'app-flow',
+                app_secret: 'secret-flow',
+              },
+            },
+          ],
         },
         {
           id: 'docs',
@@ -185,7 +280,13 @@ describe('global config (~/.dreamux/config.json)', () => {
     expect(displayed).not.toContain('secret-docs');
     expect(JSON.parse(displayed)).toMatchObject({
       dispatchers: [
-        { feishu: { app_id: 'app-flow', app_secret: '<redacted>' } },
+        {
+          channels: [
+            {
+              config: { app_id: 'app-flow', app_secret: '<redacted>' },
+            },
+          ],
+        },
         { nested: { app_secret: '<redacted>' } },
       ],
     });
@@ -197,16 +298,11 @@ describe('global config (~/.dreamux/config.json)', () => {
       /state_path is not supported/,
     );
 
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          enabled: 'yes',
-          feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-        },
-      ],
-    });
-    await expect(loadOrInitConfig({ configDir })).rejects.toThrow(
+    const fileObject = testSingleDispatcherFileObject({ id: 'flow' });
+    (fileObject['dispatchers'] as Record<string, unknown>[])[0]!['enabled'] =
+      'yes';
+    writeConfigObject(fileObject);
+    await expect(loadOrInitConfigWithBuiltins({ configDir })).rejects.toThrow(
       /enabled must be a boolean/,
     );
   });
@@ -220,124 +316,356 @@ describe('global config (~/.dreamux/config.json)', () => {
       /top-level "codex" block is no longer supported/,
     );
     await expect(loadOrInitConfig({ configDir })).rejects.toThrow(
-      /dispatchers\[\]\.codex/,
+      /agents\[\] with provider "builtin:codex"/,
     );
   });
 
-  it('rejects an invalid dispatcher-local approval_policy', async () => {
-    writeConfigObject({
+  it('rejects pre-providerized dispatcher config without rewriting it', async () => {
+    const file = globalConfigFile({ configDir });
+    const original = JSON.stringify({
       dispatchers: [
         {
           id: 'flow',
           feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-          codex: { approval_policy: 'ask-every-time' },
+          codex: { approval_policy: 'never' },
         },
       ],
     });
-    await expect(loadOrInitConfig({ configDir })).rejects.toThrow(
-      /codex\.approval_policy='ask-every-time'/,
-    );
-  });
+    writeConfigText(file, original);
 
-  it('defaults dispatcher-local codex.bin and initialize_timeout_ms', async () => {
-    writeConfigObject({
-      dispatchers: [
-        { id: 'flow', feishu: { app_id: 'app-flow', app_secret: 'secret-flow' } },
-      ],
-    });
-    const { config } = await loadConfig({ configDir });
-    expect(config.dispatchers[0]?.codex.bin).toBe('codex');
-    expect(config.dispatchers[0]?.codex.initialize_timeout_ms).toBe(10000);
-  });
-
-  it('accepts dispatcher-local codex.bin and initialize_timeout_ms overrides', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-          codex: { bin: '/opt/custom-codex', initialize_timeout_ms: 30000 },
-        },
-      ],
-    });
-    const { config } = await loadConfig({ configDir });
-    expect(config.dispatchers[0]?.codex.bin).toBe('/opt/custom-codex');
-    expect(config.dispatchers[0]?.codex.initialize_timeout_ms).toBe(30000);
-  });
-
-  it('rejects an empty dispatcher-local codex.bin', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-          codex: { bin: '   ' },
-        },
-      ],
-    });
     await expect(loadConfig({ configDir })).rejects.toThrow(
-      /codex\.bin must be a non-empty string/,
+      /feishu is not supported by the providerized config v2 schema/,
     );
+    await expect(loadConfig({ configDir })).rejects.toThrow(/channels\[\]/);
+    expect(readFileSync(file, 'utf8')).toBe(original);
   });
 
-  it('rejects a non-positive dispatcher-local initialize_timeout_ms', async () => {
-    writeConfigObject({
+  // #98 fail-loud: the old inline-runtime shape and the new schema's broken
+  // references each fail with rebuild guidance — no compat shim, no silent
+  // migration.
+  it('fails loud on the old inline dispatchers[].runtime shape with rebuild guidance', async () => {
+    const file = globalConfigFile({ configDir });
+    const original = JSON.stringify({
+      agents: [],
       dispatchers: [
         {
           id: 'flow',
-          feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-          codex: { initialize_timeout_ms: 0 },
-        },
-      ],
-    });
-    await expect(loadConfig({ configDir })).rejects.toThrow(
-      /initialize_timeout_ms must be > 0/,
-    );
-  });
-
-  it('accepts the MVP dispatcher array schema', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'dispatcher-a',
-          cwd: '~/workspace-a',
-          enabled: true,
-          feishu: {
-            app_id: 'app-a',
-            app_secret: 'secret-a',
+          channels: [
+            {
+              id: 'primary',
+              provider: 'builtin:feishu',
+              config: { app_id: 'app-flow', app_secret: 'secret-flow' },
+            },
+          ],
+          runtime: {
+            provider: 'builtin:codex',
+            config: { approval_policy: 'never' },
           },
-          codex: {
-            extra_args: ['--model', 'gpt-5'],
-            extra_env: {
-              EXAMPLE_FLAG: '1',
+        },
+      ],
+    });
+    writeConfigText(file, original);
+
+    await expect(loadConfig({ configDir })).rejects.toThrow(
+      /dispatchers\[0\]\.runtime is no longer supported/,
+    );
+    await expect(loadConfig({ configDir })).rejects.toThrow(/agentRuntime/);
+    // No silent migration: the operator's file is untouched.
+    expect(readFileSync(file, 'utf8')).toBe(original);
+  });
+
+  it('fails loud when a dispatcher is missing agentRuntime', async () => {
+    writeConfigObject({
+      agents: [{ id: 'codex', provider: 'builtin:codex', config: {} }],
+      dispatchers: [
+        {
+          id: 'flow',
+          channels: [
+            {
+              id: 'primary',
+              provider: 'builtin:feishu',
+              config: { app_id: 'app-flow', app_secret: 'secret-flow' },
+            },
+          ],
+        },
+      ],
+    });
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /dispatchers\[0\]\.agentRuntime is required/,
+    );
+  });
+
+  it('fails loud on a dangling agentRuntime reference', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [{ id: 'codex', provider: 'builtin:codex', config: {} }],
+        dispatchers: [{ id: 'flow', agentRuntime: 'does-not-exist' }],
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /agentRuntime='does-not-exist' does not match any agents\[\]\.id/,
+    );
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(/Known agents: 'codex'/);
+  });
+
+  it('fails loud on a duplicate agents[].id', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          { id: 'codex', provider: 'builtin:codex', config: {} },
+          { id: 'codex', provider: 'builtin:codex', config: {} },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'codex' }],
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /agents\[1\]\.id duplicates agent 'codex'/,
+    );
+  });
+
+  it('fails loud when top-level agents is not an array', async () => {
+    writeConfigObject({
+      agents: { codex: { provider: 'builtin:codex' } },
+      dispatchers: [],
+    });
+
+    await expect(loadConfig({ configDir })).rejects.toThrow(
+      /agents must be an array \(got object\)/,
+    );
+  });
+
+  it('resolves an agent shared by two dispatchers (cross-dispatcher reuse)', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          {
+            id: 'shared-codex',
+            provider: 'builtin:codex',
+            config: { sandbox_mode: 'read-only' },
+          },
+        ],
+        dispatchers: [
+          {
+            id: 'flow',
+            agentRuntime: 'shared-codex',
+            feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
+          },
+          {
+            id: 'docs',
+            agentRuntime: 'shared-codex',
+            feishu: { app_id: 'app-docs', app_secret: 'secret-docs' },
+          },
+        ],
+      }),
+    );
+
+    const { config } = await loadConfigWithBuiltins({ configDir });
+    expect(Object.keys(config.agents)).toEqual(['shared-codex']);
+    expect(dispatcherCodexConfig(config.dispatchers[0]!).sandbox_mode).toBe(
+      'read-only',
+    );
+    expect(dispatcherCodexConfig(config.dispatchers[1]!).sandbox_mode).toBe(
+      'read-only',
+    );
+    // Both dispatchers resolve to the same shared agent config.
+    expect(config.dispatchers[0]?.runtime).toEqual(config.dispatchers[1]?.runtime);
+  });
+
+  it('resolves a claude teammate-style agent alongside a codex dispatcher agent', async () => {
+    // The cross-provider case the normalization structurally fixes: a codex
+    // dispatcher with a distinct claude agent both declared in agents[].
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          { id: 'codex', provider: 'builtin:codex', config: {} },
+          {
+            id: 'claude',
+            provider: 'builtin:claude-code',
+            config: { permission_mode: 'default' },
+          },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'codex' }],
+      }),
+    );
+
+    const { config } = await loadConfigWithBuiltins({ configDir });
+    expect(config.agents['codex']?.provider).toBe('builtin:codex');
+    expect(config.agents['claude']?.provider).toBe('builtin:claude-code');
+    expect(config.dispatchers[0]?.runtime.provider).toBe('builtin:codex');
+  });
+
+  it('one provider, two named agent configs resolve to different configs (#148)', async () => {
+    // A single provider (builtin:codex) may have TWO named entries in agents[]
+    // with different config blocks. Two dispatchers referencing each one must
+    // land on independent resolved configs — not the same object.
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          {
+            id: 'codex-safe',
+            provider: 'builtin:codex',
+            config: { approval_policy: 'on-failure', sandbox_mode: 'read-only' },
+          },
+          {
+            id: 'codex-yolo',
+            provider: 'builtin:codex',
+            config: { approval_policy: 'never', sandbox_mode: 'danger-full-access' },
+          },
+        ],
+        dispatchers: [
+          {
+            id: 'safe',
+            agentRuntime: 'codex-safe',
+            feishu: { app_id: 'app-safe', app_secret: 'secret-safe' },
+          },
+          {
+            id: 'yolo',
+            agentRuntime: 'codex-yolo',
+            feishu: { app_id: 'app-yolo', app_secret: 'secret-yolo' },
+          },
+        ],
+      }),
+    );
+
+    const { config } = await loadConfigWithBuiltins({ configDir });
+    // Both agents map to the same provider …
+    expect(config.agents['codex-safe']?.provider).toBe('builtin:codex');
+    expect(config.agents['codex-yolo']?.provider).toBe('builtin:codex');
+    // … but their resolved configs are different instances with distinct values.
+    expect(config.agents['codex-safe']?.config).not.toEqual(
+      config.agents['codex-yolo']?.config,
+    );
+    expect(dispatcherCodexConfig(config.dispatchers[0]!).approval_policy).toBe(
+      'on-failure',
+    );
+    expect(dispatcherCodexConfig(config.dispatchers[0]!).sandbox_mode).toBe(
+      'read-only',
+    );
+    expect(dispatcherCodexConfig(config.dispatchers[1]!).approval_policy).toBe(
+      'never',
+    );
+    expect(dispatcherCodexConfig(config.dispatchers[1]!).sandbox_mode).toBe(
+      'danger-full-access',
+    );
+    // Each dispatcher's runtime matches only its own named agent.
+    expect(config.dispatchers[0]?.runtime).toEqual(config.agents['codex-safe']);
+    expect(config.dispatchers[1]?.runtime).toEqual(config.agents['codex-yolo']);
+  });
+
+  it('rejects an invalid agent approval_policy', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        codex: { approval_policy: 'ask-every-time' },
+      }),
+    );
+    await expect(loadOrInitConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /agents\[0\]\.config\.approval_policy='ask-every-time'/,
+    );
+  });
+
+  it('defaults agent config.bin and initialize_timeout_ms', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({ id: 'flow', codex: {} }),
+    );
+    const { config } = await loadConfigWithBuiltins({ configDir });
+    const codex = dispatcherCodexConfig(config.dispatchers[0]!);
+    expect(codex.bin).toBe('codex');
+    expect(codex.initialize_timeout_ms).toBe(10000);
+  });
+
+  it('accepts agent config.bin and initialize_timeout_ms overrides', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        codex: { bin: '/opt/custom-codex', initialize_timeout_ms: 30000 },
+      }),
+    );
+    const { config } = await loadConfigWithBuiltins({ configDir });
+    const codex = dispatcherCodexConfig(config.dispatchers[0]!);
+    expect(codex.bin).toBe('/opt/custom-codex');
+    expect(codex.initialize_timeout_ms).toBe(30000);
+  });
+
+  it('rejects an empty agent config.bin', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        codex: { bin: '   ' },
+      }),
+    );
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /agents\[0\]\.config\.bin must be a non-empty string/,
+    );
+  });
+
+  it('rejects a non-positive agent config.initialize_timeout_ms', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        codex: { initialize_timeout_ms: 0 },
+      }),
+    );
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /agents\[0\]\.config\.initialize_timeout_ms must be > 0/,
+    );
+  });
+
+  it('accepts the providerized dispatcher config v2 schema', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          {
+            id: 'dispatcher-a',
+            provider: 'builtin:codex',
+            config: {
+              extra_args: ['--model', 'gpt-5'],
+              extra_env: {
+                EXAMPLE_FLAG: '1',
+              },
             },
           },
-        },
-        {
-          id: 'dispatcher.b',
-          feishu: {
-            app_id: 'app-b',
-            app_secret: 'secret-b',
+          { id: 'dispatcher.b', provider: 'builtin:codex', config: {} },
+        ],
+        dispatchers: [
+          {
+            id: 'dispatcher-a',
+            cwd: '~/workspace-a',
+            enabled: true,
+            agentRuntime: 'dispatcher-a',
+            feishu: { app_id: 'app-a', app_secret: 'secret-a' },
           },
-        },
-      ],
-    });
+          {
+            id: 'dispatcher.b',
+            agentRuntime: 'dispatcher.b',
+            feishu: { app_id: 'app-b', app_secret: 'secret-b' },
+          },
+        ],
+      }),
+    );
 
-    const { config } = await loadConfig({ configDir });
+    const { config } = await loadConfigWithBuiltins({ configDir });
+    const firstFeishu = dispatcherFeishuConfig(config.dispatchers[0]!);
+    const firstCodex = dispatcherCodexConfig(config.dispatchers[0]!);
     expect(config.dispatchers[0]).toMatchObject({
       id: 'dispatcher-a',
       enabled: true,
-      feishu: {
-        app_id: 'app-a',
-        app_secret: 'secret-a',
-      },
-      codex: {
-        approval_policy: DEFAULT_APPROVAL_POLICY,
-        sandbox_mode: DEFAULT_SANDBOX_MODE,
-        extra_args: ['--model', 'gpt-5'],
-        extra_env: {
-          EXAMPLE_FLAG: '1',
-        },
+      channels: [{ provider: 'builtin:feishu' }],
+      runtime: { provider: 'builtin:codex' },
+    });
+    expect(firstFeishu).toEqual({
+      app_id: 'app-a',
+      app_secret: 'secret-a',
+    });
+    expect(firstCodex).toMatchObject({
+      approval_policy: DEFAULT_APPROVAL_POLICY,
+      sandbox_mode: DEFAULT_SANDBOX_MODE,
+      extra_args: ['--model', 'gpt-5'],
+      extra_env: {
+        EXAMPLE_FLAG: '1',
       },
     });
     expect(config.dispatchers[0]?.cwd).not.toContain('~');
@@ -345,141 +673,340 @@ describe('global config (~/.dreamux/config.json)', () => {
       id: 'dispatcher.b',
       cwd: null,
       enabled: true,
-      feishu: {
-        app_id: 'app-b',
-        app_secret: 'secret-b',
-      },
+      channels: [{ provider: 'builtin:feishu' }],
+      runtime: { provider: 'builtin:codex' },
+    });
+    expect(dispatcherFeishuConfig(config.dispatchers[1]!)).toEqual({
+      app_id: 'app-b',
+      app_secret: 'secret-b',
     });
   });
 
-  it('rejects unsupported dispatcher secret fields', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: {
-            app_id: 'app-flow',
-            app_secret: 'secret-flow',
-            callback_secret: 'future-only',
-          },
-        },
-      ],
+  it('rejects reserved npm channel refs without loading them', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        channelProvider: 'npm:@example/dreamux-channel#provider',
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /not a built-in Dreamux channel/,
+    );
+  });
+
+  it('rejects unknown builtin channel refs', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        channelProvider: 'builtin:matrix',
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /not a built-in Dreamux channel/,
+    );
+  });
+
+  it('rejects runtime provider refs in channel config', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        channelProvider: 'builtin:codex',
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /not a built-in Dreamux channel/,
+    );
+  });
+
+  it('validates config provider refs through the injected provider registry', async () => {
+    const registry = createBuiltinProviderRegistry();
+    registry.register({
+      id: 'custom-runtime',
+      kind: 'agentRuntime',
+      ref: parseProviderRef('builtin:custom-runtime'),
+    });
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          { id: 'flow', provider: 'builtin:custom-runtime', config: {} },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'flow' }],
+      }),
+    );
+
+    await expect(loadConfig({ configDir, providerRegistry: registry })).rejects.toThrow(
+      /registered but not runnable/,
+    );
+    await expect(loadConfig({ configDir })).rejects.toThrow(
+      /unknown builtin provider 'custom-runtime'/,
+    );
+  });
+
+  it('loads external npm runtime providers before validating runtime config', async () => {
+    const providerRef = 'npm:@example/dreamux-runtime#provider';
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          { id: 'flow', provider: providerRef, config: { provider_option: 'kept' } },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'flow' }],
+      }),
+    );
+
+    const { config, providerRegistry } = await loadConfig({
+      configDir,
+      externalAgentRuntimeModuleImporter: async (packageName) => {
+        expect(packageName).toBe('@example/dreamux-runtime');
+        return { provider: externalRuntimeFactory };
+      },
     });
 
-    await expect(loadConfig({ configDir })).rejects.toThrow(
+    expect(config.agents['flow']).toEqual({
+      provider: providerRef,
+      config: {
+        provider_option: 'kept',
+        parsed_by_provider: true,
+      },
+    });
+    expect(config.dispatchers[0]?.runtime).toEqual({
+      provider: providerRef,
+      config: {
+        provider_option: 'kept',
+        parsed_by_provider: true,
+      },
+    });
+    expect(providerRegistry.resolve(providerRef).kind).toBe('agentRuntime');
+    expect(providerRegistry.getImplementation(providerRef)).not.toBeUndefined();
+  });
+
+  it('fails loudly when an external npm runtime package cannot be imported', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          { id: 'flow', provider: 'npm:@example/missing-runtime', config: {} },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'flow' }],
+      }),
+    );
+
+    await expect(
+      loadConfig({
+        configDir,
+        externalAgentRuntimeModuleImporter: async () => {
+          throw new Error('package not found');
+        },
+      }),
+    ).rejects.toThrow(/npm:@example\/missing-runtime/);
+    await expect(
+      loadConfig({
+        configDir,
+        externalAgentRuntimeModuleImporter: async () => {
+          throw new Error('package not found');
+        },
+      }),
+    ).rejects.toThrow(/could not import package/);
+  });
+
+  it('accepts a builtin:claude-code agent with its own config shape', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          {
+            id: 'flow',
+            provider: 'builtin:claude-code',
+            config: {
+              bin: 'claude',
+              model: 'sonnet',
+              permission_mode: 'acceptEdits',
+              remote_control: true,
+              extra_args: [],
+              extra_env: {},
+            },
+          },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'flow' }],
+      }),
+    );
+
+    const { config } = await loadConfigWithBuiltins({ configDir });
+    expect(config.agents['flow']?.provider).toBe('builtin:claude-code');
+    expect(config.dispatchers[0]?.runtime.provider).toBe('builtin:claude-code');
+    expect(config.dispatchers[0]?.runtime.config).toMatchObject({
+      remote_control: true,
+    });
+  });
+
+  it('rejects non-boolean remote_control under a claude-code agent config', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          {
+            id: 'flow',
+            provider: 'builtin:claude-code',
+            config: { bin: 'claude', remote_control: 'yes' },
+          },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'flow' }],
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /remote_control must be a boolean/,
+    );
+  });
+
+  it('rejects codex-only keys under a claude-code agent config (runtime-owned validation)', async () => {
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          {
+            id: 'flow',
+            provider: 'builtin:claude-code',
+            // approval_policy is a Codex-only field; the Claude Code runtime
+            // owns its own schema and must reject it rather than ignore it.
+            config: { bin: 'claude', approval_policy: 'never' },
+          },
+        ],
+        dispatchers: [{ id: 'flow', agentRuntime: 'flow' }],
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /approval_policy is not supported/,
+    );
+  });
+
+  it('rejects multiple channels while Phase 1 wires one channel per dispatcher', async () => {
+    const fileObject = testSingleDispatcherFileObject({ id: 'flow' });
+    const dispatcher = (fileObject['dispatchers'] as Record<string, unknown>[])[0]!;
+    (dispatcher['channels'] as unknown[]).push({
+      id: 'secondary',
+      provider: 'builtin:feishu',
+      config: {
+        app_id: 'app-flow-secondary',
+        app_secret: 'secret-flow-secondary',
+      },
+    });
+    writeConfigObject(fileObject);
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /must contain exactly one channel in this phase/,
+    );
+  });
+
+  it('rejects unsupported dispatcher secret fields', async () => {
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        feishu: {
+          app_id: 'app-flow',
+          app_secret: 'secret-flow',
+          callback_secret: 'future-only',
+        } as never,
+      }),
+    );
+
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
       /callback_secret is not supported/,
     );
   });
 
-  it('keeps access out of config and validates extra_env fields', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: {
-            app_id: 'app-flow',
-            app_secret: 'secret-flow',
-          },
-          access: {},
-        },
-      ],
-    });
-    await expect(loadConfig({ configDir })).rejects.toThrow(
+  it('keeps access out of config and validates agent extra_env fields', async () => {
+    const withAccess = testSingleDispatcherFileObject({ id: 'flow' });
+    (withAccess['dispatchers'] as Record<string, unknown>[])[0]!['access'] = {};
+    writeConfigObject(withAccess);
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
       /access is not supported/,
     );
 
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: {
-            app_id: 'app-flow',
-            app_secret: 'secret-flow',
-          },
-          codex: {
-            extra_env: {
-              EXAMPLE_FLAG: 1,
-            },
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        codex: {
+          extra_env: {
+            EXAMPLE_FLAG: 1,
           },
         },
-      ],
-    });
-    await expect(loadConfig({ configDir })).rejects.toThrow(
-      /codex\.extra_env\.EXAMPLE_FLAG must be a string/,
+      }),
+    );
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
+      /agents\[0\]\.config\.extra_env\.EXAMPLE_FLAG must be a string/,
     );
   });
 
   it('requires unique Feishu app_id values across all dispatchers', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          enabled: false,
-          feishu: {
-            app_id: 'app-shared',
-            app_secret: 'secret-flow',
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [
+          { id: 'flow', provider: 'builtin:codex', config: {} },
+          { id: 'docs', provider: 'builtin:codex', config: {} },
+        ],
+        dispatchers: [
+          {
+            id: 'flow',
+            enabled: false,
+            agentRuntime: 'flow',
+            feishu: { app_id: 'app-shared', app_secret: 'secret-flow' },
           },
-        },
-        {
-          id: 'docs',
-          feishu: {
-            app_id: 'app-shared',
-            app_secret: 'secret-docs',
+          {
+            id: 'docs',
+            agentRuntime: 'docs',
+            feishu: { app_id: 'app-shared', app_secret: 'secret-docs' },
           },
-        },
-      ],
-    });
+        ],
+      }),
+    );
 
-    await expect(loadConfig({ configDir })).rejects.toThrow(
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
       /duplicates dispatcher 'flow'/,
     );
   });
 
   it('rejects dispatcher ids that would not be stable path segments', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'team/alpha beta',
-          feishu: {
-            app_id: 'app-flow',
-            app_secret: 'secret-flow',
+    writeConfigObject(
+      testConfigFileObject({
+        agents: [{ id: 'flow', provider: 'builtin:codex', config: {} }],
+        dispatchers: [
+          {
+            id: 'team/alpha beta',
+            agentRuntime: 'flow',
+            feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
           },
-        },
-      ],
-    });
+        ],
+      }),
+    );
 
-    await expect(loadConfig({ configDir })).rejects.toThrow(/dispatchers\[0\]\.id/);
-    await expect(loadConfig({ configDir })).rejects.toThrow(/ASCII letters/);
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(/dispatchers\[0\]\.id/);
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(/ASCII letters/);
   });
 
   it('requires non-empty Feishu app_id and app_secret values', async () => {
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: {
-            app_id: '',
-            app_secret: 'secret-flow',
-          },
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        feishu: {
+          app_id: '',
+          app_secret: 'secret-flow',
         },
-      ],
-    });
-    await expect(loadConfig({ configDir })).rejects.toThrow(
+      }),
+    );
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
       /app_id must be a non-empty string/,
     );
 
-    writeConfigObject({
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: {
-            app_id: 'app-flow',
-            app_secret: '   ',
-          },
+    writeConfigObject(
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        feishu: {
+          app_id: 'app-flow',
+          app_secret: '   ',
         },
-      ],
-    });
-    await expect(loadConfig({ configDir })).rejects.toThrow(
+      }),
+    );
+    await expect(loadConfigWithBuiltins({ configDir })).rejects.toThrow(
       /app_secret must be a non-empty string/,
     );
   });
@@ -608,43 +1135,39 @@ describe('sandbox_mode precedence', () => {
 
   it('a dispatcher omitting sandbox_mode gets the workspace-write default', async () => {
     expect(DEFAULT_SANDBOX_MODE).toBe('workspace-write');
-    writeConfigObjectAt(configDir, {
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-        },
-      ],
-    });
-    const { config } = await loadOrInitConfig({ configDir });
-    expect(config.dispatchers[0]?.codex.sandbox_mode).toBe('workspace-write');
+    writeConfigObjectAt(
+      configDir,
+      testSingleDispatcherFileObject({ id: 'flow', codex: {} }),
+    );
+    const { config } = await loadOrInitConfigWithBuiltins({ configDir });
+    expect(dispatcherCodexConfig(config.dispatchers[0]!).sandbox_mode).toBe(
+      'workspace-write',
+    );
   });
 
-  it('a dispatcher-local sandbox_mode is loaded and validated', async () => {
-    writeConfigObjectAt(configDir, {
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-          codex: { sandbox_mode: 'danger-full-access' },
-        },
-      ],
-    });
-    const { config } = await loadOrInitConfig({ configDir });
-    expect(config.dispatchers[0]?.codex.sandbox_mode).toBe('danger-full-access');
+  it('an agent sandbox_mode is loaded and validated', async () => {
+    writeConfigObjectAt(
+      configDir,
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        codex: { sandbox_mode: 'danger-full-access' },
+      }),
+    );
+    const { config } = await loadOrInitConfigWithBuiltins({ configDir });
+    expect(dispatcherCodexConfig(config.dispatchers[0]!).sandbox_mode).toBe(
+      'danger-full-access',
+    );
   });
 
-  it('config rejects an invalid dispatcher-local sandbox_mode at load time', async () => {
-    writeConfigObjectAt(configDir, {
-      dispatchers: [
-        {
-          id: 'flow',
-          feishu: { app_id: 'app-flow', app_secret: 'secret-flow' },
-          codex: { sandbox_mode: 'not-a-mode' },
-        },
-      ],
-    });
-    await expect(loadOrInitConfig({ configDir })).rejects.toThrow(
+  it('config rejects an invalid agent sandbox_mode at load time', async () => {
+    writeConfigObjectAt(
+      configDir,
+      testSingleDispatcherFileObject({
+        id: 'flow',
+        codex: { sandbox_mode: 'not-a-mode' },
+      }),
+    );
+    await expect(loadOrInitConfigWithBuiltins({ configDir })).rejects.toThrow(
       /sandbox_mode='not-a-mode'/,
     );
   });

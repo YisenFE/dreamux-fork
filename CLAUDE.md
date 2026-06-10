@@ -55,7 +55,7 @@ two-paths consequence of `.agents/decisions/rush-pnpm-monorepo.md`).
 The user-facing CLI is the single global bin `dreamux`. Current command tree:
 `onboard`, `uninstall`, `serve`, `status`, `doctor`,
 `daemon install|uninstall|start|stop|restart`,
-`dispatcher add|remove|list|status|start|stop`, `feishu-mcp`,
+`dispatcher add|remove|list|status|start|stop`, `feishu-mcp`, `teammate-mcp`,
 `config path|show`, and `changelog [--json]`. `dreamux changelog` prints the
 installed package's rush-generated `CHANGELOG.md` (or `CHANGELOG.json` with
 `--json`) — an offline read of the installed version, the upgrade-time
@@ -94,10 +94,13 @@ That record wins over older runtime-dir / SQLite decisions.
   `dreamux serve` must fail loudly when it is missing and tell the operator
   to run `dreamux onboard`.
 - `~/.dreamux/state/` — server-owned state: `server.json`, `admin.sock`, and
-  per-dispatcher `status.json`, `access.json`, and Codex socket files. Safe to
-  remove when the operator intentionally wants to discard server state.
+  per-dispatcher `status.json`, `access.json`, Codex socket files, and
+  `teammate/` task ledgers. Safe to remove when the operator intentionally
+  wants to discard server state.
 - `~/.dreamux/logs/` — server-owned logs, split by component; Codex
-  app-server logs use `~/.dreamux/logs/codex-app-server/<dispatcher>.log`.
+  app-server logs use `~/.dreamux/logs/codex-app-server/<dispatcher>.log`, and
+  MCP shim diagnostics use component directories such as `feishu-mcp/` and
+  `teammate-mcp/`.
 - `~/.codex/` — Codex's own global home for auth, config, and memory.
   Dispatcher app-server processes follow Codex here; dreamux must not create
   dispatcher-private `CODEX_HOME` directories for the MVP.
@@ -140,13 +143,21 @@ explicitly supersedes the top-level design.
   work from any cwd and via `~/bin/<x>` shortcuts. The POSIX symlink-walk
   loop in `/packages/dreamux/bin/dreamux` is the reference shape; reuse it
   verbatim for any new launcher.
-- **Path builders go in `src/runtime/paths.ts` only.** Cross-process file
-  contracts (the admin socket path, dispatcher state files, logs, and Codex
-  socket path) drift silently if any other file constructs them by raw string
+- **Neutral path builders go in `src/platform/paths.ts` only; per-runtime path
+  derivation lives in each builtin's `src/agent-runtime/builtin/<name>/paths.ts`.**
+  Cross-process file contracts (the admin socket path, dispatcher state files,
+  logs) drift silently if any other file constructs them by raw string
   concatenation.
-- **Codex protocol bumps run through `src/codex/handshake.ts` first.** Any
+- **Codex protocol bumps run through `src/agent-runtime/builtin/codex/handshake.ts`
+  first.** Any
   RPC before `initialize` is rejected with `Not initialized` on codex
   0.134+ — confirmed end-to-end in `tests/codex-0135-live.test.ts`.
+- **Teammate reverse-delivery requires codex 0.137+.** `completionInput`
+  delivers a finished teammate's result to the dispatcher via
+  `thread/inject_items` (codex 0.137+; see issue #147), then triggers a turn.
+  Older codex versions lack that RPC, so completion delivery fails loudly with a
+  0.137 hint rather than silently dropping. The proactive doctor/version gate for
+  this lives with the per-runtime `diagnostic` capability (issue #148).
 - **Tests that depend on a real codex install fail loudly when codex is
   missing**, not silent skip. Opt-in skip via `DREAMUX_SKIP_LIVE_CODEX=1`
   (see `tests/codex-0135-live.test.ts`'s docstring).

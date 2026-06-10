@@ -1,13 +1,97 @@
 ---
 name: dispatcher
-description: Use from a Dreamux dispatcher thread when bounded repository work should be delegated to a tm-managed teammate. Applies to spawning, sending, waiting, checking status, resuming, recovering, or summarizing teammate work through the tm CLI exposed by the Dreamux package.
+description: Use from a Dreamux dispatcher thread when bounded repository work should be delegated to a TeamMate. The server-hosted TeamMate MCP is the default interface; spawn creates a named semi-resident TeamMate, send submits follow-up turns and reopens a closed TeamMate from its checkpoint, close stops one, history lists session ledger rows, history_events reads a raw timeline, and list/status/last/ctx/get_capabilities inspect state. The tm CLI is the explicit fallback for legacy diagnostics. Applies to spawning, tracking, retrieving, sending, closing, inspecting, reopening, recovering, or summarizing teammate work.
 ---
 
 # Dispatcher
 
-Use this skill only from a Dreamux dispatcher session. Dreamux hosts the
-dispatcher Codex app-server and exposes `tm` on the dispatcher `PATH`. `tm`
-owns teammate lifecycle, history, and repository worktrees; Dreamux does not.
+Use this skill only from a Dreamux dispatcher session. The dispatcher delegates
+bounded repository work to TeamMates and reports verified results back to the
+source chat.
+
+## TeamMate Interface
+
+Reach a TeamMate through the server-hosted TeamMate MCP by default. Drop to the
+`tm` CLI only for what the MCP does not yet cover. Pick by what you need, not by
+habit.
+
+### Server-hosted TeamMate MCP — the primary interface
+
+Dreamux injects a dispatcher-scoped `teammate` MCP server. It creates named
+semi-resident TeamMate agents through the same AgentRuntime contract as
+dispatchers, then lets you submit follow-up turns, reopen closed agents from
+their checkpoint, inspect state, and close agents without holding a shell
+session or polling a process.
+
+**Lifecycle.**
+
+- `spawn` — create a named TeamMate and submit the first turn. Use a stable name
+  for work you may resume later. When selecting a runtime, pass one of
+  `get_capabilities.agent_runtimes[].id` as `agent_runtime`; do not pass
+  provider refs such as `builtin:*`.
+- `send` — submit a turn to a TeamMate. If the named TeamMate is not live —
+  including one previously `close`d — send first reopens it from its persisted
+  checkpoint, then submits. There is no separate `resume` verb; send covers
+  reattach.
+- `close` — stop the named TeamMate and mark it closed. It stays reopenable: a
+  later `send` revives it from its checkpoint.
+
+**Watch and collect — no polling.**
+
+- `list` — this dispatcher's TeamMates and their statuses.
+- `status` — one TeamMate status, agent runtime id, checkpoint, and close metadata.
+- `history` — bounded session ledger rows for this dispatcher, with filters for
+  recovery across TeamMates.
+- `history_events` — raw forward-only event history for one named TeamMate.
+- `last` — the runtime's latest assistant-visible result when supported.
+- `ctx` — the runtime context snapshot when supported.
+
+These serve status / history / last directly, so you do not need `tm` to check
+on a running TeamMate. Do not wait or poll for completion: submit the turn, let
+the dispatcher turn end, then recover through `history`, `last`, and `ctx`.
+
+**Team lifecycle.**
+
+Dreamux also injects a dispatcher-scoped `team` MCP server for Team Mode
+lifecycle. Use it to create a TeamLeader, inspect Team status/ledger, and
+dissolve a Team. Team work still runs through agents; do not inspect the target
+repo directly from the dispatcher.
+
+- `create` — create a Team and TeamLeader. Requires `repo_cwd` and
+  `leader_agent_runtime`; no default leader runtime is inferred.
+- `create_group` — from a P2P control channel, create a Team, create a Feishu
+  group, invite the requester/peers when Feishu permissions allow it, and bind
+  the new group to the TeamLeader. The source P2P remains with the dispatcher.
+- `list`, `status`, `ledger` — read dispatcher-owned Team records and lifecycle
+  ledger rows.
+- `bind_channel` — bind a Feishu group chat to a TeamLeader. P2P binding is
+  rejected.
+- `transfer_channel_back` — return a bound Feishu group chat to the dispatcher.
+- `dissolve` — close the TeamLeader and team-owned members, then conservatively
+  clean up the shared managed worktree. Active channel bindings are transferred
+  back first.
+
+**Control and inspect.**
+
+- `get_capabilities` — spawnable `agents[].id` values under `agent_runtimes[]`,
+  each with runtime capabilities: resume, steer, events, last, and context. Use
+  `spawn({ agent_runtime: id, ... })` with one of those ids. Claude Code Remote
+  Control is an external Claude UI surface, distinct from Dreamux `send` steer;
+  keep trusting `steer.supported` from the returned capabilities.
+
+The persistent identity and history files are the source of truth. A TeamMate
+reopened by send continues from its saved runtime checkpoint; do not create a
+new name unless you want a separate session.
+
+### tm CLI — the explicit fallback
+
+Dreamux hosts the dispatcher Codex app-server and exposes `tm` on the dispatcher
+`PATH`. `tm` owns live tm **session** state: teammate liveness, repository
+worktrees, and resumable session history. Reach for it only for what the MCP
+does not yet cover — resuming or recovering a dead session, multi-turn
+isolated managed worktrees — and for legacy diagnostics. It is
+not the default orchestration path. The rest of this skill and its references
+are the operational manual for that fallback.
 
 ## Router Posture
 
@@ -28,6 +112,9 @@ repo. It does not investigate that repo itself.
 
 ## Boundaries
 
+These govern the tm fallback path. For the primary MCP path, call the injected
+`teammate` MCP tools directly.
+
 - Invoke bare `tm` from the dispatcher environment `PATH`. Dreamux injects its
   package `bin/` directory into the dispatcher app-server PATH.
 - Do not use `npx`, `npm exec --package @excitedjs/tm`, or a version-qualified
@@ -39,11 +126,12 @@ repo. It does not investigate that repo itself.
   installed or authenticated in this environment is not a usable choice. State
   `--engine` explicitly so the selection is intentional rather than inherited
   from a tm version default.
-- Do not call dreamux admin APIs to create or recover teammate state. The
-  server hosts the dispatcher; tm owns teammates.
+- Do not call dreamux admin APIs directly to create or recover teammate state.
+  Reach server-owned TeamMate agent state only through the `teammate` MCP tools;
+  reach live tm sessions only through `tm`.
 - Do not infer the target repository from the dispatcher cwd unless the user or
   operator explicitly made that cwd the requested repo.
-- Do not ask a tm-managed teammate to spawn another tm teammate.
+- Do not ask a TeamMate to spawn or close another TeamMate.
 
 ## When To Delegate
 
@@ -71,11 +159,15 @@ on a flag -- do not infer one verb's flags from another.
 
 ## Scenario Routing
 
-Read the matching reference before reaching for the verb:
+These references cover the `tm` fallback path. For ordinary delegation —
+spawning a TeamMate, sending follow-up turns (which also reopens a closed one
+from its checkpoint), checking status, or reading history/last/context — use the
+`teammate` MCP tools above and you do not need a reference.
+Read the matching reference when you have dropped to `tm`:
 
 | Intent | Reference |
 |---|---|
-| Spawn a teammate, compose its prompt, send follow-up, collect the result | `references/dispatch-task.md` |
+| Use the tm fallback to spawn a managed-worktree teammate or send a legacy tm turn | `references/dispatch-task.md` |
 | Look up, re-read, or resume a prior or dead teammate session | `references/inspect-and-resume.md` |
 
 For multi-teammate review, design negotiation, merge, or unblock coordination,
@@ -86,8 +178,9 @@ use the `team-dev-workflow` skill, which layers methodology on top of this one.
 A reply to the source chat that asserts an outcome must be verifiable from this
 turn's tool calls.
 
-- Report only what `tm` returned. Do not invent a teammate result that was not
-  printed by a `tm` verb.
+- Report only what the TeamMate interface returned, whether a `teammate` MCP
+  tool result or a `tm` verb. Do not invent a teammate result that was not
+  produced by one of them.
 - Verify any command, flag, or path before naming it; if you cannot verify it
   this turn, say so rather than guessing a name.
 - Translate dispatcher-internal identifiers into plain language before the
@@ -99,6 +192,14 @@ turn's tool calls.
 
 ## State Boundary
 
-Do not say the Dreamux server lost or recovered teammate state. The server does
-not own that state. Teammate liveness, history, and recovery flow through `tm`
-(see `references/inspect-and-resume.md`).
+Two state owners, kept distinct:
+
+- The Dreamux server owns the TeamMate **agent state** behind the `teammate`
+  MCP — named identities, runtime checkpoints, status, history, last result,
+  and context snapshots. Read and control it with `list`, `status`, `history`,
+  `last`, `ctx`, `send`, and `close`.
+- `tm` owns live tm **session** state — teammate liveness, worktrees, and
+  resumable session history (see `references/inspect-and-resume.md`).
+
+Do not conflate the two. Recovering a tm session is not the same as resuming a
+server-owned TeamMate identity, and the server does not own tm session liveness.

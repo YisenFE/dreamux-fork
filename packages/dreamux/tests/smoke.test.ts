@@ -11,6 +11,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+// eslint-disable-next-line no-restricted-imports -- git worktree smoke fixture setup uses synchronous git commands to create a local repository before async server assertions begin (issue #85 test-scope carve-out).
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   lstatSync,
@@ -33,33 +35,56 @@ import {
   type CodexProcessExit,
   type CodexProcessExitHandler,
   type CodexProcessOptions,
-} from '../src/codex/supervisor.js';
-import { CodexWsClient } from '../src/codex/rpc.js';
-import { createFakeFeishuBot, type FakeFeishuBot, type FeishuInboundEvent } from '../src/feishu/bot.js';
+} from '../src/agent-runtime/builtin/codex/supervisor.js';
+import { CodexWsClient } from '../src/agent-runtime/builtin/codex/rpc.js';
+import { createFakeFeishuBot, type FakeFeishuBot, type FeishuInboundEvent } from '../src/channel/feishu/bot.js';
 import { createAdminSocketServer } from '../src/admin/socket.js';
 import { sendAdminRequest } from '../src/admin/client.js';
 import {
   TRUST_DOMAIN_WARNING,
   loadDispatcherAccess,
   saveDispatcherAccess,
-} from '../src/channel/feishu-gate.js';
-import { loadChatBots } from '../src/channel/chat-bots-store.js';
-import { BUILT_IN_DEFAULTS, type DreamuxConfig } from '../src/runtime/config.js';
+} from '../src/channel/feishu/feishu-gate.js';
+import { loadChatBots } from '../src/channel/feishu/chat-bots-store.js';
+import {
+  BUILT_IN_DEFAULTS,
+  type DreamuxConfig,
+} from '../src/config/config.js';
+import {
+  defaultDispatcherCwd,
+  bundledSkillDir,
+  restartIntentPath,
+} from '../src/platform/paths.js';
 import {
   dispatcherAppServerControlDir,
-  dispatcherCodexCwd,
   dispatcherCodexHome,
-  bundledSkillDir,
-  dispatcherWorkspaceSkillDir,
   dispatcherSocketPath,
-  restartIntentPath,
-} from '../src/runtime/paths.js';
+  dispatcherWorkspaceSkillDir,
+} from '../src/agent-runtime/builtin/codex/paths.js';
 import { writeRestartIntent } from '../src/daemon/restart-intent.js';
-import { dreamuxBinPath } from '../src/runtime/package-bin.js';
-import { createLogger, type DreamuxLogger } from '../src/runtime/logger.js';
-import { DREAMUX_DISPATCHER_BASE_INSTRUCTIONS } from '../src/dispatcher/base-prompt.js';
+import { dreamuxBinPath } from '../src/platform/package-bin.js';
+import { createLogger, type DreamuxLogger } from '../src/platform/logger.js';
+import { DREAMUX_DISPATCHER_BASE_INSTRUCTIONS } from '../src/dispatcher-service/dispatcher/base-prompt.js';
+import { TeamMateIdentityStore } from '../src/dispatcher-service/teammate/identity-store.js';
 import { startFakeCodex, type FakeCodex } from './fake-codex.js';
+import { testDispatcherConfig, testDreamuxConfig } from './helpers/config.js';
 import { Writable } from 'node:stream';
+import {
+  loadExternalAgentRuntimeProviders,
+  type AgentRuntime,
+  type AgentRuntimeCapabilities,
+  type AgentRuntimeCreateContext,
+  type AgentRuntimeLastResult,
+  type AgentRuntimeProvider,
+  type AgentRuntimeSystemInput,
+  type AgentRuntimeTurnResult,
+  type ExternalAgentRuntimeProviderFactory,
+} from '../src/agent-runtime/index.js';
+import type { InboundTurnInput } from '../src/agent-runtime/turn.js';
+import {
+  createBuiltinProviderRegistry,
+  type ProviderRegistry,
+} from '../src/registry/index.js';
 
 /** Collect every JSON log line written to an injected logger destination. */
 function captureLogger(name: string): {
@@ -115,9 +140,11 @@ function buildServer(opts: {
   codexRestartBackoffBaseMs?: number;
   codexRestartBackoffMaxMs?: number;
   channelLoggerFactory?: (dispatcherId: string) => DreamuxLogger;
+  providerRegistry?: ProviderRegistry;
 }): Server {
   return new Server({
     config: opts.config ?? BUILT_IN_DEFAULTS,
+    providerRegistry: opts.providerRegistry,
     adminSocketPath: join(opts.runtimeDir, 'admin.sock'),
     skipBotSecret: opts.skipBotSecret ?? true,
     ...(opts.channelLoggerFactory !== undefined
@@ -144,6 +171,94 @@ function buildServer(opts: {
           },
         }),
   });
+}
+
+const EXTERNAL_RUNTIME_CAPABILITIES: AgentRuntimeCapabilities = {
+  resume: { supported: true, checkpoint: 'externalSession' },
+  steer: { supported: false },
+  events: { kind: 'synthesized' },
+  last: { supported: true },
+  context: { supported: false },
+  systemPrompt: { mode: 'replace' },
+  teammateCompletion: [],
+};
+
+class SmokeExternalRuntime implements AgentRuntime {
+  private status: ReturnType<AgentRuntime['getStatus']> = 'declared';
+
+  constructor(
+    readonly providerRef: string,
+    private readonly context: AgentRuntimeCreateContext,
+  ) {}
+
+  async start(): Promise<void> {
+    this.status = 'ready';
+    await this.context.dispatchers.setStatus(
+      this.context.row.dispatcher_id,
+      'ready',
+    );
+  }
+
+  async resume(): Promise<void> {
+    await this.start();
+  }
+
+  async stop(): Promise<void> {
+    this.status = 'stopped';
+  }
+
+  async channelInput(
+    _input: InboundTurnInput,
+  ): Promise<AgentRuntimeTurnResult> {
+    return { status: 'submitted', turnId: 'external-turn' };
+  }
+
+  async systemInput(
+    _notice: AgentRuntimeSystemInput,
+  ): Promise<AgentRuntimeTurnResult> {
+    return { status: 'skipped' };
+  }
+
+  getStatus(): ReturnType<AgentRuntime['getStatus']> {
+    return this.status;
+  }
+
+  getThreadId(): string | null {
+    return 'external-session';
+  }
+
+  wasThreadResumed(): boolean {
+    return false;
+  }
+
+  async getLast(): Promise<AgentRuntimeLastResult> {
+    return { text: 'external last' };
+  }
+
+  async getContext(): Promise<null> {
+    return null;
+  }
+
+  getCapabilities(): AgentRuntimeCapabilities {
+    return EXTERNAL_RUNTIME_CAPABILITIES;
+  }
+}
+
+function smokeExternalFactory(
+  contexts: AgentRuntimeCreateContext[],
+): ExternalAgentRuntimeProviderFactory {
+  return ({ ref, descriptor }) => {
+    const provider: AgentRuntimeProvider = {
+      ref,
+      descriptor,
+      getCapabilities: () => EXTERNAL_RUNTIME_CAPABILITIES,
+      createRuntime(context) {
+        contexts.push(context);
+        return new SmokeExternalRuntime(ref, context);
+      },
+    };
+    return provider;
+  };
 }
 
 class ControllableCodexProcess extends CodexProcess {
@@ -214,9 +329,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function echoReadableCodexInput(input: string): string {
-  const match = input.match(
-    /<feishu_message\b[^>]*>\n([\s\S]*?)\n<\/feishu_message>/,
-  );
+  const match = input.match(/<channel\b[^>]*>\n([\s\S]*?)\n<\/channel>/);
   return `echo: ${(match?.[1] ?? input).trim()}`;
 }
 
@@ -227,8 +340,8 @@ function captureAndEchoCodexInput(inputs: string[]): (input: string) => string {
   };
 }
 
-function feishuMessageBlockCount(input: string): number {
-  return input.match(/<feishu_message\b/g)?.length ?? 0;
+function channelBlockCount(input: string): number {
+  return input.match(/<channel\b/g)?.length ?? 0;
 }
 
 function writeReadyDispatcherCodexHome(dispatcherId: string, dispatcherCwd?: string): void {
@@ -236,34 +349,48 @@ function writeReadyDispatcherCodexHome(dispatcherId: string, dispatcherCwd?: str
   writeFileSync(join(dispatcherCodexHome(dispatcherId), 'auth.json'), '{}', {
     mode: 0o600,
   });
-  mkdirSync(dispatcherCwd ?? dispatcherCodexCwd(dispatcherId), { recursive: true });
+  mkdirSync(dispatcherCwd ?? defaultDispatcherCwd(dispatcherId), { recursive: true });
 }
 
-function configWithDispatcher(
-  overrides: Partial<DreamuxConfig['dispatchers'][number]> = {},
-): DreamuxConfig {
-  return {
-    ...BUILT_IN_DEFAULTS,
-    dispatchers: [
-      {
-        id: overrides.id ?? 'flow',
-        cwd: overrides.cwd ?? null,
-        enabled: overrides.enabled ?? true,
-        feishu: overrides.feishu ?? {
-          app_id: 'app-smoke',
-          app_secret: 'secret-server-only',
-        },
-        codex: overrides.codex ?? {
-          bin: 'codex',
-          approval_policy: 'never',
-          sandbox_mode: 'workspace-write',
-          extra_args: [],
-          extra_env: {},
-          initialize_timeout_ms: 10000,
-        },
+function initGitRepoSync(path: string): string {
+  mkdirSync(path, { recursive: true });
+  execFileSync('git', ['init', '-b', 'main'], { cwd: path });
+  execFileSync('git', ['config', 'user.name', 'Dreamux Test'], { cwd: path });
+  execFileSync('git', ['config', 'user.email', 'dreamux-test@example.com'], { cwd: path });
+  writeFileSync(join(path, 'README.md'), 'test\n');
+  execFileSync('git', ['add', 'README.md'], { cwd: path });
+  execFileSync('git', ['commit', '-m', 'Initial test commit'], { cwd: path });
+  return path;
+}
+
+interface ConfigDispatcherOverrides {
+  id?: string;
+  cwd?: string | null;
+  enabled?: boolean;
+  feishu?: Record<string, unknown>;
+  codex?: Record<string, unknown>;
+}
+
+function configWithDispatcher(overrides: ConfigDispatcherOverrides = {}): DreamuxConfig {
+  return testDreamuxConfig([
+    testDispatcherConfig({
+      id: overrides.id ?? 'flow',
+      cwd: overrides.cwd ?? null,
+      enabled: overrides.enabled ?? true,
+      feishu: overrides.feishu ?? {
+        app_id: 'app-smoke',
+        app_secret: 'secret-server-only',
       },
-    ],
-  };
+      codex: overrides.codex ?? {
+        bin: 'codex',
+        approval_policy: 'never',
+        sandbox_mode: 'workspace-write',
+        extra_args: [],
+        extra_env: {},
+        initialize_timeout_ms: 10000,
+      },
+    }),
+  ]);
 }
 
 describe('dreamux MVP smoke', () => {
@@ -278,7 +405,7 @@ describe('dreamux MVP smoke', () => {
     runtimeDir = mkdtempSync(join(tmpdir(), 'dreamux-'));
     previousHome = process.env['HOME'];
     process.env['HOME'] = join(runtimeDir, 'home');
-    mkdirSync(dispatcherCodexCwd('flow'), { recursive: true });
+    mkdirSync(defaultDispatcherCwd('flow'), { recursive: true });
     codexInputs = [];
     fake = await startFakeCodex({
       replyFor: captureAndEchoCodexInput(codexInputs),
@@ -322,13 +449,13 @@ describe('dreamux MVP smoke', () => {
 
     await bot.inject(fakeInbound('chat-group-a', 'hi', 'msg-1-id'));
 
-    await waitFor(() => codexInputs.length === 1);
+    await waitFor(() => codexInputs.length === 1, 10000);
     await sleep(80);
     expect(bot.sentMessages).toEqual([]);
     expect(codexInputs).toHaveLength(1);
-    expect(codexInputs[0]).toContain('<feishu_message');
-    expect(codexInputs[0]).toContain('  sender_name=""');
-    expect(codexInputs[0]).toContain('  create_time=');
+    expect(codexInputs[0]).toContain('<channel source="feishu"');
+    expect(codexInputs[0]).toContain(' sender_name=""');
+    expect(codexInputs[0]).toContain(' create_time=');
     expect(codexInputs[0]).toContain('hi');
     expect(bot.reactions).toEqual([
       {
@@ -380,10 +507,14 @@ describe('dreamux MVP smoke', () => {
     );
 
     // list_chat_bots exposes trusted as { open_id, name? }; missing name omitted.
-    const listing = await server.listChatBotsFromMcp({
+    const listing = await server.dispatcherService.callFeishuMcpTool({
       dispatcherId: 'flow',
-      chatId: 'chat-group-a',
-    });
+      toolName: 'list_chat_bots',
+      arguments: { chat_id: 'chat-group-a' },
+    }) as {
+      chat_id: string;
+      trusted: Array<{ open_id: string; name?: string }>;
+    };
     expect(listing.chat_id).toBe('chat-group-a');
     expect(listing.trusted).toEqual([
       { open_id: 'peer-bee', name: 'Bee' },
@@ -399,7 +530,7 @@ describe('dreamux MVP smoke', () => {
         mentions: atUs,
       }),
     );
-    await waitFor(() => codexInputs.length === 1);
+    await waitFor(() => codexInputs.length === 1, 10000);
     expect(codexInputs[0]).toContain('hello from bee');
 
     // 3) Trusted bot WITHOUT an @ → dropped (no new Codex turn).
@@ -434,19 +565,89 @@ describe('dreamux MVP smoke', () => {
     await server.start();
 
     expect(capturedCodexOptions).toHaveLength(1);
+    expect(server.dispatcherService.getRuntime('flow')?.providerRef).toBe(
+      'builtin:codex',
+    );
     expect(capturedCodexOptions[0]?.env?.['CODEX_HOME']).toBeUndefined();
     expect(capturedCodexOptions[0]?.env?.['PATH']).toContain('/bin');
     expect(capturedCodexOptions[0]?.socketPath).toBe(
       dispatcherSocketPath('flow'),
     );
     const dispatcherSkillDir = dispatcherWorkspaceSkillDir(
-      dispatcherCodexCwd('flow'),
+      defaultDispatcherCwd('flow'),
       'dispatcher',
     );
     expect(lstatSync(dispatcherSkillDir).isSymbolicLink()).toBe(true);
     expect(realpathSync(dispatcherSkillDir)).toBe(
       realpathSync(bundledSkillDir('dispatcher')),
     );
+  });
+
+  it('starts an external npm AgentRuntime through DispatcherService', async () => {
+    const providerRef = 'npm:@example/dreamux-runtime#provider';
+    const registry = createBuiltinProviderRegistry();
+    const contexts: AgentRuntimeCreateContext[] = [];
+    await loadExternalAgentRuntimeProviders({
+      registry,
+      refs: [providerRef],
+      importModule: async (packageName) => {
+        expect(packageName).toBe('@example/dreamux-runtime');
+        return { provider: smokeExternalFactory(contexts) };
+      },
+    });
+    const spawnCounter = { count: 0 };
+    server = buildServer({
+      runtimeDir,
+      fake,
+      bot,
+      providerRegistry: registry,
+      spawnCounter,
+      config: {
+        dispatchers: [
+          testDispatcherConfig({
+            id: 'flow',
+            runtime: {
+              provider: providerRef,
+              config: {
+                external_option: true,
+              },
+            },
+          }),
+        ],
+      },
+    });
+
+    await server.start();
+
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0]?.dispatcher?.runtime.provider).toBe(providerRef);
+    expect(server.dispatcherService.getRuntime('flow')?.providerRef).toBe(
+      providerRef,
+    );
+    expect(spawnCounter.count).toBe(0);
+  });
+
+  it('fails loud when external runtime config is not paired with its loaded registry', () => {
+    const providerRef = 'npm:@example/dreamux-runtime#provider';
+
+    expect(() =>
+      buildServer({
+        runtimeDir,
+        fake,
+        bot,
+        config: {
+          dispatchers: [
+            testDispatcherConfig({
+              id: 'flow',
+              runtime: {
+                provider: providerRef,
+                config: {},
+              },
+            }),
+          ],
+        },
+      }),
+    ).toThrow(/providerRegistry returned by loadConfig/);
   });
 
   it('starts fresh Codex threads with Dreamux dispatcher base instructions', async () => {
@@ -488,6 +689,21 @@ describe('dreamux MVP smoke', () => {
       'use update_plan to track phases',
     );
     expect(DREAMUX_DISPATCHER_BASE_INSTRUCTIONS).toContain('`【F:...】`');
+    // TeamMate MCP is the default orchestration interface for named agents.
+    expect(DREAMUX_DISPATCHER_BASE_INSTRUCTIONS).toContain('# TeamMate Delegation');
+    expect(DREAMUX_DISPATCHER_BASE_INSTRUCTIONS).toContain(
+      'server-hosted TeamMate MCP is the primary interface',
+    );
+    expect(DREAMUX_DISPATCHER_BASE_INSTRUCTIONS).toContain(
+      'named, semi-resident TeamMate agents',
+    );
+    // tm survives only as the labeled fallback, not the primary contract.
+    expect(DREAMUX_DISPATCHER_BASE_INSTRUCTIONS).toContain(
+      'The tm CLI is the labeled fallback',
+    );
+    // The stale Phase 1 / not-to-completion caveat must be gone (#126 PR6).
+    expect(DREAMUX_DISPATCHER_BASE_INSTRUCTIONS).not.toContain('Phase 1 boundary');
+    expect(DREAMUX_DISPATCHER_BASE_INSTRUCTIONS).not.toContain('# tm Delegation');
   });
 
   it('resumes Codex threads with Dreamux dispatcher base instructions', async () => {
@@ -565,10 +781,11 @@ describe('dreamux MVP smoke', () => {
     expect(JSON.stringify(capturedCodexOptions)).not.toContain('secret-server-only');
   });
 
-  it('injects dispatcher-scoped Feishu MCP config after operator Codex args', async () => {
+  it('injects dispatcher-scoped Dreamux MCP config after operator Codex args', async () => {
     const capturedCodexOptions: CodexProcessOptions[] = [];
-    // Operator codex args are now a per-dispatcher setting (dispatchers[].codex
-    // .extra_args); there is no top-level codex block to carry them.
+    // Operator codex args are now a per-dispatcher runtime setting
+    // (dispatchers[].runtime.config.extra_args); there is no top-level codex
+    // block to carry them.
     server = buildServer({
       runtimeDir,
       fake,
@@ -589,18 +806,96 @@ describe('dreamux MVP smoke', () => {
     await server.start();
 
     const args = capturedCodexOptions[0]?.extraArgs ?? [];
-    const dreamuxCommand = `mcp_servers.feishu.command=${JSON.stringify(dreamuxBinPath())}`;
+    const feishuCommand = `mcp_servers.feishu.command=${JSON.stringify(dreamuxBinPath())}`;
+    const teammateCommand =
+      `mcp_servers.teammate.command=${JSON.stringify(dreamuxBinPath())}`;
+    const teamCommand =
+      `mcp_servers.team.command=${JSON.stringify(dreamuxBinPath())}`;
     expect(args).toContain('mcp_servers.feishu.command="operator-feishu"');
     const operatorIdx = args.indexOf('mcp_servers.feishu.command="operator-feishu"');
-    const dreamuxIdx = args.indexOf(dreamuxCommand);
-    expect(dreamuxIdx).toBeGreaterThan(operatorIdx);
+    const feishuIdx = args.indexOf(feishuCommand);
+    const teammateIdx = args.indexOf(teammateCommand);
+    const teamIdx = args.indexOf(teamCommand);
+    expect(feishuIdx).toBeGreaterThan(operatorIdx);
+    expect(teammateIdx).toBeGreaterThan(operatorIdx);
+    expect(teamIdx).toBeGreaterThan(operatorIdx);
     expect(dreamuxBinPath()).toMatch(/\/dreamux$/);
     expect(args).toContain(
       `mcp_servers.feishu.args=["feishu-mcp", "--dispatcher", "flow", "--admin-socket", "${join(runtimeDir, 'admin.sock')}"]`,
     );
+    expect(args).toContain(
+      `mcp_servers.teammate.args=["teammate-mcp", "--dispatcher", "flow", "--caller", "dispatcher", "--admin-socket", "${join(runtimeDir, 'admin.sock')}"]`,
+    );
+    expect(args).toContain(
+      `mcp_servers.team.args=["team-mcp", "--dispatcher", "flow", "--admin-socket", "${join(runtimeDir, 'admin.sock')}"]`,
+    );
   });
 
-  it('launches a dispatcher with its own dispatchers[].codex.bin', async () => {
+  it('routes bound Feishu group inbound to the TeamLeader and transfers back', async () => {
+    const repo = initGitRepoSync(join(runtimeDir, 'team-repo'));
+    server = buildServer({ runtimeDir, fake, bot, config: configWithDispatcher() });
+    await server.start();
+
+    await server.dispatcherService.createTeam({
+      dispatcherId: 'flow',
+      name: 'alpha',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+    });
+    await server.dispatcherService.bindTeamChannel({
+      dispatcherId: 'flow',
+      teamId: 'alpha',
+      provider: 'builtin:feishu',
+      chatId: 'chat-team',
+      chatType: 'group',
+    });
+    await bot.inject(fakeInbound('chat-team', 'team hello', 'msg-team'));
+    await waitFor(() => codexInputs.some((input) => input.includes('team hello')));
+    expect(codexInputs.some((input) => input.includes('team hello'))).toBe(true);
+    await expect(
+      sendAdminRequest(
+        'mcp.react',
+        {
+          dispatcher_id: 'flow',
+          caller_kind: 'team_leader',
+          team_id: 'alpha',
+          leader_name: 'alpha-leader',
+          chat_id: 'chat-team',
+          message_id: 'msg-team',
+          emoji: 'THUMBSUP',
+        },
+        { socketPath: join(runtimeDir, 'admin.sock') },
+      ),
+    ).resolves.toMatchObject({ reaction_id: expect.any(String) });
+    await expect(
+      sendAdminRequest(
+        'mcp.react',
+        {
+          dispatcher_id: 'flow',
+          caller_kind: 'team_leader',
+          team_id: 'alpha',
+          leader_name: 'alpha-leader',
+          chat_id: 'chat-team',
+          message_id: 'msg-unknown',
+          emoji: 'THUMBSUP',
+        },
+        { socketPath: join(runtimeDir, 'admin.sock') },
+      ),
+    ).rejects.toThrow(/TeamLeader may react\/reply only to messages observed/);
+    codexInputs.length = 0;
+
+    await server.dispatcherService.transferTeamChannelBack({
+      dispatcherId: 'flow',
+      provider: 'builtin:feishu',
+      chatId: 'chat-team',
+      chatType: 'group',
+    });
+    await bot.inject(fakeInbound('chat-team', 'dispatcher again', 'msg-back'));
+    await waitFor(() => codexInputs.length === 1);
+    expect(codexInputs[0]).toContain('dispatcher again');
+  }, 10000);
+
+  it('launches a dispatcher with its own runtime.config.bin', async () => {
     const previousEnvBin = process.env['CODEX_HOST_CODEX_BIN'];
     delete process.env['CODEX_HOST_CODEX_BIN'];
     try {
@@ -631,7 +926,7 @@ describe('dreamux MVP smoke', () => {
     }
   });
 
-  it('CODEX_HOST_CODEX_BIN overrides a dispatcher codex.bin at launch', async () => {
+  it('CODEX_HOST_CODEX_BIN overrides dispatcher runtime.config.bin at launch', async () => {
     const previousEnvBin = process.env['CODEX_HOST_CODEX_BIN'];
     process.env['CODEX_HOST_CODEX_BIN'] = '/host/override-codex';
     try {
@@ -902,6 +1197,7 @@ describe('dreamux MVP smoke', () => {
       'mcp.react',
       {
         dispatcher_id: 'flow',
+        chat_id: 'chat-group-a',
         message_id: 'msg-model-react',
         emoji: 'THUMBSUP',
       },
@@ -930,13 +1226,7 @@ describe('dreamux MVP smoke', () => {
       bot,
       capturedCodexOptions,
       useDefaultCodexHomeDoctor: true,
-    });
-    server.repos.dispatchers.create({
-      dispatcher_id: 'flow',
-      bot_app_id: 'app-smoke',
-      bot_secret_ref: 'env:UNUSED',
-      codex_args_json: JSON.stringify({ sandboxMode: 'danger-full-access' }),
-      codex_cwd: join(runtimeDir, 'workspace'),
+      config: configWithDispatcher({ cwd: join(runtimeDir, 'workspace') }),
     });
     writeReadyDispatcherCodexHome('flow', join(runtimeDir, 'workspace'));
 
@@ -1875,12 +2165,15 @@ describe('dreamux MVP smoke', () => {
     });
     await server.start();
 
-    const result = await server.replyFromMcp({
+    const result = await server.dispatcherService.callFeishuMcpTool({
       dispatcherId: 'flow',
-      chatId: 'chat-group-a',
-      messageId: 'msg-reply',
-      text: REPLY_BODY,
-    });
+      toolName: 'reply',
+      arguments: {
+        chat_id: 'chat-group-a',
+        message_id: 'msg-reply',
+        text: REPLY_BODY,
+      },
+    }) as { message_ids: string[] };
     expect(result.message_ids).toEqual(['message-fake-1']);
 
     const sent = capture
@@ -1913,11 +2206,14 @@ describe('dreamux MVP smoke', () => {
     await server.start();
 
     await expect(
-      server.replyFromMcp({
+      server.dispatcherService.callFeishuMcpTool({
         dispatcherId: 'flow',
-        chatId: 'chat-group-a',
-        messageId: 'msg-reply-fail',
-        text: REPLY_BODY,
+        toolName: 'reply',
+        arguments: {
+          chat_id: 'chat-group-a',
+          message_id: 'msg-reply-fail',
+          text: REPLY_BODY,
+        },
       }),
     ).rejects.toThrow('feishu send boom');
 
@@ -1950,11 +2246,14 @@ describe('dreamux MVP smoke', () => {
     });
     await server.start();
 
-    const ok = await server.reactFromMcp({
+    const ok = await server.dispatcherService.callFeishuMcpTool({
       dispatcherId: 'flow',
-      messageId: 'msg-react',
-      emoji: 'THUMBSUP',
-    });
+      toolName: 'react',
+      arguments: {
+        message_id: 'msg-react',
+        emoji: 'THUMBSUP',
+      },
+    }) as { reaction_id: string };
     expect(ok.reaction_id).toBe('reaction-fake-1');
     const sent = capture
       .lines()
@@ -1968,10 +2267,13 @@ describe('dreamux MVP smoke', () => {
 
     bot.setReactionError(new Error('feishu react boom'));
     await expect(
-      server.reactFromMcp({
+      server.dispatcherService.callFeishuMcpTool({
         dispatcherId: 'flow',
-        messageId: 'msg-react-fail',
-        emoji: 'EYES',
+        toolName: 'react',
+        arguments: {
+          message_id: 'msg-react-fail',
+          emoji: 'EYES',
+        },
       }),
     ).rejects.toThrow('feishu react boom');
     const failed = capture
@@ -2016,7 +2318,7 @@ describe('dreamux MVP smoke', () => {
       .toHaveLength(3);
     expect(codexInputs).toHaveLength(1);
     expect(codexInputs[0]).toContain('running');
-    expect(feishuMessageBlockCount(codexInputs[0] ?? '')).toBe(3);
+    expect(channelBlockCount(codexInputs[0] ?? '')).toBe(3);
     expect(codexInputs[0]).toContain('batch-1');
     expect(codexInputs[0]).toContain('batch-2');
     expect(bot.sentMessages).toEqual([]);
@@ -2189,7 +2491,7 @@ describe('dreamux MVP smoke', () => {
   // refuse — confirms our handshake-enforcement assertion above isn't vacuous.
   it('fake codex refuses non-initialize RPC pre-handshake', async () => {
     // Use a raw client (no handshake) against the same fake.
-    const { CodexWsClient } = await import('../src/codex/rpc.js');
+    const { CodexWsClient } = await import('../src/agent-runtime/builtin/codex/rpc.js');
     const raw = new CodexWsClient({ url: fake.url });
     await raw.ready();
     await expect(
@@ -2203,9 +2505,9 @@ describe('dreamux MVP smoke', () => {
   it('handshake times out if codex accepts the WS but never replies', async () => {
     await fake.close();
     fake = await startFakeCodex({ swallowInitialize: true });
-    const { CodexWsClient } = await import('../src/codex/rpc.js');
+    const { CodexWsClient } = await import('../src/agent-runtime/builtin/codex/rpc.js');
     const { performInitializeHandshake } = await import(
-      '../src/codex/handshake.js'
+      '../src/agent-runtime/builtin/codex/handshake.js'
     );
     const raw = new CodexWsClient({ url: fake.url });
     try {
@@ -2229,11 +2531,13 @@ describe('dreamux MVP smoke', () => {
     });
     // Don't call server.start() (which would auto-start); race two explicit
     // startDispatcher calls instead.
-    const a = server.startDispatcher('flow');
-    const b = server.startDispatcher('flow');
+    const a = server.dispatcherService.startDispatcher('flow');
+    const b = server.dispatcherService.startDispatcher('flow');
     await Promise.all([a, b]);
     expect(counter.count).toBe(1);
-    expect(server.getRuntime('flow')?.getStatus()).toBe('ready');
+    expect(server.dispatcherService.getRuntime('flow')?.getStatus()).toBe(
+      'ready',
+    );
   });
 
   it('restarts the Codex child with backoff and resumes the saved thread after child exit', async () => {
@@ -2263,7 +2567,9 @@ describe('dreamux MVP smoke', () => {
     processes[0]!.emitExit({ code: 9, signal: null });
 
     await waitFor(() => processes.length >= 2);
-    await waitFor(() => server.getRuntime('flow')?.getStatus() === 'ready');
+    await waitFor(
+      () => server.dispatcherService.getRuntime('flow')?.getStatus() === 'ready',
+    );
     expect(server.repos.dispatchers.get('flow')?.thread_id).toBe(firstThreadId);
     expect(fake.methodLog.filter((method) => method === 'thread/resume'))
       .toHaveLength(1);
@@ -2294,14 +2600,19 @@ describe('dreamux MVP smoke', () => {
     expect(firstThreadId).toMatch(/^thread_fake_/);
 
     processes[0]!.emitExit({ code: 9, signal: null });
-    await waitFor(() => server.getRuntime('flow')?.getStatus() === 'degraded');
+    await waitFor(
+      () =>
+        server.dispatcherService.getRuntime('flow')?.getStatus() === 'degraded',
+    );
 
-    await server.stopDispatcher('flow');
+    await server.dispatcherService.stopDispatcher('flow');
     await sleep(150);
     expect(processes).toHaveLength(1);
 
-    await server.startDispatcher('flow');
-    await waitFor(() => server.getRuntime('flow')?.getStatus() === 'ready');
+    await server.dispatcherService.startDispatcher('flow');
+    await waitFor(
+      () => server.dispatcherService.getRuntime('flow')?.getStatus() === 'ready',
+    );
     expect(processes).toHaveLength(2);
     expect(server.repos.dispatchers.get('flow')?.thread_id).toBe(firstThreadId);
     expect(fake.methodLog.filter((method) => method === 'thread/resume'))
@@ -2334,7 +2645,9 @@ describe('dreamux MVP smoke', () => {
     await oldFake.close();
 
     await waitFor(() => fake.methodLog.includes('thread/resume'), 3000);
-    await waitFor(() => server.getRuntime('flow')?.getStatus() === 'ready');
+    await waitFor(
+      () => server.dispatcherService.getRuntime('flow')?.getStatus() === 'ready',
+    );
     expect(server.repos.dispatchers.get('flow')?.thread_id).toBe(firstThreadId);
     expect(fake.methodLog).not.toContain('thread/start');
   });
@@ -2368,7 +2681,9 @@ describe('dreamux MVP smoke', () => {
 
     await bot.inject(fakeInbound('chat-group-a', 'slow turn', 'msg-slow'));
     await sleep(80);
-    expect(server.getRuntime('flow')?.getStatus()).toBe('ready');
+    expect(server.dispatcherService.getRuntime('flow')?.getStatus()).toBe(
+      'ready',
+    );
     expect(processes).toHaveLength(1);
     expect(bot.sentMessages).toEqual([]);
 

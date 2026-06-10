@@ -2,7 +2,7 @@
 
 - **Status:** Implemented runtime contract for issue #63
 - **Source:** https://github.com/excitedjs/dreamux/issues/63
-- **Affects:** `/packages/dreamux/src/dispatcher/turn-manager.ts`, `/packages/dreamux/src/dispatcher/runtime.ts`, `/packages/dreamux/src/codex/events.ts`, `/packages/dreamux/src/server.ts`, `/packages/dreamux/tests/fake-codex.ts`, `/packages/dreamux/tests/codex-live.test.ts`
+- **Affects:** `/packages/dreamux/src/dispatcher/turn-manager.ts`, `/packages/dreamux/src/agent-runtime/codex-runtime.ts`, `/packages/dreamux/src/codex/events.ts`, `/packages/dreamux/src/server.ts`, `/packages/dreamux/tests/fake-codex.ts`, `/packages/dreamux/tests/codex-live.test.ts`
 
 ## Locked Scope
 
@@ -60,8 +60,8 @@ flowchart LR
 `turn/completed`. A long Codex turn therefore blocks later accepted Feishu
 messages from reaching Codex.
 
-The channel added one `RECEIVED_REACTION_EMOJI` after
-`DispatcherRuntime.enqueueInbound()` returned true. Issue #63 replaced this
+The channel added one `RECEIVED_REACTION_EMOJI` after the old Codex runtime
+`enqueueInbound()` path returned true. Issue #63 replaced this
 with a three-state channel-owned reaction flow.
 
 ## Runtime Model
@@ -95,7 +95,7 @@ inbound.
   reaction to in-progress at the `turn/start` acceptance point.
 - Do not track active turn ids. Do not call `turn/steer`.
 
-`packages/dreamux/src/dispatcher/runtime.ts`
+`packages/dreamux/src/agent-runtime/codex-runtime.ts`
 
 - Keep owning the Codex client and thread id.
 - Replace the synchronous boolean `enqueueInbound()` result with an async
@@ -113,16 +113,15 @@ inbound.
   helper if still useful.
 - Do not add a `turn/steer` helper for normal Feishu inbound.
 
-`packages/dreamux/src/server.ts`
+`packages/dreamux/src/channel/feishu-channel.ts`
 
-- In `Server.startDispatcher()`'s `bot.start(async event)` handler, add the
-  received emoji immediately after the access gate passes and `message_id`
-  dedupe reports a miss. Do not react to dropped messages or duplicate
-  redeliveries.
+- In `FeishuChannelSession`'s inbound message handler, add the received emoji
+  immediately after the access gate passes and `message_id` dedupe reports a
+  miss. Do not react to dropped messages or duplicate redeliveries.
 - After `runtime.enqueueInbound()` reports `turn/start` acceptance, replace the
   received reaction with the in-progress emoji.
-- In `replyFromMcp()`, keep clearing the channel-owned reaction for
-  `input.messageId` after the model reply is sent.
+- In the channel-owned `reply` MCP handler, keep clearing the channel-owned
+  reaction for `input.messageId` after the model reply is sent.
 - Replace the single `receivedReactions` map with a channel-owned inbound
   reaction ledger that stores the current reaction id and state per message id.
   A reaction is replaced **add-then-cancel** (issue #69): add the new emoji

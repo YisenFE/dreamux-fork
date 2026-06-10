@@ -20,14 +20,11 @@ import {
   expandHome,
   globalConfigDir,
   globalConfigFile,
-  loadConfig,
   type DispatcherConfig,
-} from '../runtime/config.js';
-import {
-  dispatcherWorkspaceSkillDirs,
-  logsRoot,
-  stateRoot,
-} from '../runtime/paths.js';
+} from '../config/config.js';
+import { loadConfigWithBuiltins } from '../agent-runtime/load-config.js';
+import { logsRoot, stateRoot } from '../platform/paths.js';
+import { dispatcherWorkspaceSkillDirs } from '../agent-runtime/builtin/codex/paths.js';
 
 export type UninstallStatus = 'removed' | 'missing' | 'skipped';
 
@@ -108,7 +105,7 @@ async function warnIfConfigIsNotReadable(
   try {
     await assertNoLegacyTomlOnly({ configDir });
     if (!(await pathExists(globalConfigFile({ configDir })))) return;
-    await loadConfig({ configDir });
+    await loadConfigWithBuiltins({ configDir });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     warnings.push(
@@ -119,7 +116,7 @@ async function warnIfConfigIsNotReadable(
 
 async function collectWorkspaceSkillPaths(configDir: string): Promise<string[]> {
   try {
-    return (await loadConfig({ configDir })).config.dispatchers
+    return (await loadConfigWithBuiltins({ configDir })).config.dispatchers
       .flatMap(dispatcherWorkspaceSkillPathsFromConfig);
   } catch {
     return [];

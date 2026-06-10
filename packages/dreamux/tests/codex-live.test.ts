@@ -30,12 +30,12 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
-import { CodexProcess } from '../src/codex/supervisor.js';
-import { CodexWsClient, type CodexWsClientOptions } from '../src/codex/rpc.js';
-import { performInitializeHandshake } from '../src/codex/handshake.js';
-import { feishuMcpCodexArgs } from '../src/codex/mcp-config.js';
-import { codexArgsToCli, parseCodexArgs } from '../src/runtime/codex-args.js';
-import { dreamuxBinPath } from '../src/runtime/package-bin.js';
+import { CodexProcess } from '../src/agent-runtime/builtin/codex/supervisor.js';
+import { CodexWsClient, type CodexWsClientOptions } from '../src/agent-runtime/builtin/codex/rpc.js';
+import { performInitializeHandshake } from '../src/agent-runtime/builtin/codex/handshake.js';
+import { feishuMcpCodexArgs } from '../src/agent-runtime/builtin/codex/mcp-config.js';
+import { codexArgsToCli, parseCodexArgs } from '../src/agent-runtime/builtin/codex/args.js';
+import { dreamuxBinPath } from '../src/platform/package-bin.js';
 import {
   IN_PROGRESS_REACTION_EMOJI,
   RECEIVED_REACTION_EMOJI,
@@ -45,13 +45,14 @@ import {
   createFakeFeishuBot,
   type FakeFeishuBot,
   type FeishuInboundEvent,
-} from '../src/feishu/bot.js';
-import { saveDispatcherAccess } from '../src/channel/feishu-gate.js';
-import { type DreamuxConfig } from '../src/runtime/config.js';
+} from '../src/channel/feishu/bot.js';
+import { saveDispatcherAccess } from '../src/channel/feishu/feishu-gate.js';
+import type { DreamuxConfig } from '../src/config/config.js';
 import type {
   ServerNotification,
   ThreadStartResponse,
-} from '../src/codex/types.js';
+} from '../src/agent-runtime/builtin/codex/types.js';
+import { testDispatcherConfig } from './helpers/config.js';
 
 export const SKIP_ENV = 'DREAMUX_SKIP_LIVE_CODEX';
 export const MODEL_GATE_ENV = 'DREAMUX_RUN_LIVE_MODEL_GATE';
@@ -191,7 +192,7 @@ function fakeInbound(
 function liveConfig(dispatcherCwd: string, codexHomeEnv: string): DreamuxConfig {
   return {
     dispatchers: [
-      {
+      testDispatcherConfig({
         id: 'live',
         cwd: dispatcherCwd,
         enabled: true,
@@ -211,7 +212,7 @@ function liveConfig(dispatcherCwd: string, codexHomeEnv: string): DreamuxConfig 
           // dispatcher-local field rather than a global default.
           initialize_timeout_ms: 15000,
         },
-      },
+      }),
     ],
   };
 }

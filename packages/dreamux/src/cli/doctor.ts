@@ -13,26 +13,30 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-import { codexArgsToCli, parseCodexArgs } from '../runtime/codex-args.js';
+import { resolveCodexBinPath } from '../agent-runtime/builtin/codex/provider.js';
 import {
   BUILT_IN_DEFAULTS,
   DEFAULT_CODEX_BIN,
   type DispatcherConfig,
   globalConfigDir,
   globalConfigFile,
-  loadConfig,
   type DreamuxConfig,
-} from '../runtime/config.js';
+} from '../config/config.js';
+import { loadConfigWithBuiltins } from '../agent-runtime/load-config.js';
 import {
-  dispatcherCodexHomeDoctorContext,
-  validateDispatcherCodexHome,
-  type DispatcherCodexHomeDoctorResult,
-} from '../runtime/dispatcher-codex-home.js';
+  AgentRuntimeProviderCatalog,
+  registerBuiltinAgentRuntimeProviders,
+} from '../agent-runtime/catalog.js';
+import { createBuiltinProviderRegistry } from '../registry/index.js';
+import type {
+  AgentRuntimeBinCheck,
+  AgentRuntimeDiagnosticContext,
+  AgentRuntimeDoctorResult,
+} from '../agent-runtime/types.js';
 import {
-  dispatcherCodexCwd,
   setRuntimeConfig,
   stateRoot,
-} from '../runtime/paths.js';
+} from '../platform/paths.js';
 import { ExecaCommandRunner } from '../onboard/commands.js';
 import {
   defaultServiceNodeProbe,
@@ -82,8 +86,9 @@ export interface DoctorCheck {
 
 export interface DispatcherDoctorReport {
   id: string;
-  foreground: DispatcherCodexHomeDoctorResult;
-  managedService: DispatcherCodexHomeDoctorResult | null;
+  runtimeProvider: string;
+  foreground: AgentRuntimeDoctorResult;
+  managedService: AgentRuntimeDoctorResult | null;
 }
 
 export interface DreamuxDoctorResult {
@@ -95,13 +100,18 @@ export interface DreamuxDoctorResult {
   dispatchers: DispatcherDoctorReport[];
 }
 
+type RuntimeBinaryCheck = AgentRuntimeBinCheck;
+
 export async function runDreamuxDoctor(
   options: DoctorOptions = {},
 ): Promise<DreamuxDoctorResult> {
   const runner = options.runner ?? new ExecaCommandRunner();
   const checks: DoctorCheck[] = [];
   const configDir = globalConfigDir();
-  const { config, configFile } = await readConfigForDoctor(configDir, checks);
+  const { config, configFile, catalog } = await readConfigForDoctor(
+    configDir,
+    checks,
+  );
   setRuntimeConfig(config);
 
   checks.push({
@@ -110,21 +120,14 @@ export async function runDreamuxDoctor(
     detail: stateRoot(),
   });
 
-  // The codex binary is per-dispatcher (dispatchers[].codex.bin), overridable
-  // by CODEX_HOST_CODEX_BIN. Sanity-check each distinct resolved bin; with no
-  // dispatchers, fall back to the default so a bare install still reports.
+  // Runtime binaries are provider-owned: each provider self-declares its bin
+  // checks via its diagnostic capability; doctor dedups + executes them.
   const doctorEnv = options.env ?? process.env;
-  const codexBins = [
-    ...new Set(
-      config.dispatchers.map((d) => resolveCodexBin(d.codex.bin, doctorEnv)),
-    ),
-  ];
-  if (codexBins.length === 0) codexBins.push(resolveCodexBin(DEFAULT_CODEX_BIN, doctorEnv));
-  for (const bin of codexBins) {
+  for (const check of runtimeBinaryChecks(catalog, config.dispatchers, doctorEnv)) {
     checks.push({
-      name: 'codex binary',
-      ok: await runner.check(bin, ['--help']),
-      detail: bin,
+      name: check.name,
+      ok: await runner.check(check.bin, check.args),
+      detail: check.bin,
     });
   }
 
@@ -151,11 +154,14 @@ export async function runDreamuxDoctor(
     service,
     runner,
     options.nodeProbe ?? defaultServiceNodeProbe,
+    catalog,
     config.dispatchers,
   );
 
   const dispatchers = await readDispatchers(
+    catalog,
     config,
+    runner,
     options.env ?? process.env,
     service,
   );
@@ -203,15 +209,25 @@ export function printDoctorResult(result: DreamuxDoctorResult): void {
 async function readConfigForDoctor(
   configDir: string,
   checks: DoctorCheck[],
-): Promise<{ config: DreamuxConfig; configFile: string }> {
+): Promise<{
+  config: DreamuxConfig;
+  configFile: string;
+  catalog: AgentRuntimeProviderCatalog;
+}> {
   try {
-    const loaded = await loadConfig({ configDir });
+    const loaded = await loadConfigWithBuiltins({ configDir });
     checks.push({
       name: 'config',
       ok: true,
       detail: loaded.configFile,
     });
-    return loaded;
+    return {
+      config: loaded.config,
+      configFile: loaded.configFile,
+      catalog: new AgentRuntimeProviderCatalog({
+        registry: loaded.providerRegistry,
+      }),
+    };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     checks.push({
@@ -222,36 +238,53 @@ async function readConfigForDoctor(
     return {
       config: BUILT_IN_DEFAULTS,
       configFile: globalConfigFile({ configDir }),
+      catalog: builtinDoctorCatalog(),
     };
   }
 }
 
+/**
+ * A catalog over a fresh builtin registry, used when config failed to load (so
+ * the empty-dispatchers default-codex bin check still resolves its provider).
+ */
+function builtinDoctorCatalog(): AgentRuntimeProviderCatalog {
+  const registry = createBuiltinProviderRegistry();
+  registerBuiltinAgentRuntimeProviders({ registry });
+  return new AgentRuntimeProviderCatalog({ registry });
+}
+
 async function readDispatchers(
+  catalog: AgentRuntimeProviderCatalog,
   config: DreamuxConfig,
+  runner: CommandRunner,
   env: NodeJS.ProcessEnv,
   service: ServiceStatus,
 ): Promise<DispatcherDoctorReport[]> {
   return Promise.all(
     config.dispatchers.map(async (dispatcher) => {
-      const codexArgs = parseCodexArgs(dispatcherCodexArgsJson(dispatcher));
-      const codexCliArgs = codexArgsToCli(codexArgs);
-      const context = dispatcherCodexHomeDoctorContext(dispatcher.id, {
-        codexCliArgs,
-        dispatcherCwd: dispatcher.cwd ?? dispatcherCodexCwd(dispatcher.id),
-      });
-      const foreground = await validateDispatcherCodexHome(context, {
-        env,
-        codexCliArgs,
-      });
-      const managedServiceEnv = service.environment ?? {};
-      const managedService = service.installed
-        ? await validateDispatcherCodexHome(context, {
-            env: managedServiceEnv,
-            codexCliArgs,
-          })
-        : null;
+      const provider = catalog.resolve(dispatcher.runtime.provider);
+      const diagnostic = provider.diagnostic;
+      const foreground = diagnostic
+        ? await diagnostic.runDiagnostic(
+            { dispatcher, env, scope: 'foreground' },
+            runner,
+          )
+        : neutralRuntimeDoctor(dispatcher.runtime.provider);
+      const managedService = !service.installed
+        ? null
+        : diagnostic
+          ? await diagnostic.runDiagnostic(
+              {
+                dispatcher,
+                env: service.environment ?? {},
+                scope: 'managedService',
+              },
+              runner,
+            )
+          : neutralRuntimeDoctor(dispatcher.runtime.provider);
       return {
         id: dispatcher.id,
+        runtimeProvider: dispatcher.runtime.provider,
         foreground,
         managedService,
       };
@@ -259,15 +292,13 @@ async function readDispatchers(
   );
 }
 
-function dispatcherCodexArgsJson(dispatcher: DispatcherConfig): string {
-  // approval_policy / sandbox_mode always carry a dispatcher-local default.
-  return JSON.stringify({
-    approvalPolicy: dispatcher.codex.approval_policy,
-    sandboxMode: dispatcher.codex.sandbox_mode,
-    ...(dispatcher.codex.extra_args.length > 0
-      ? { extraArgs: dispatcher.codex.extra_args }
-      : {}),
-  });
+/** Neutral result for a provider that declares no diagnostic surface. */
+function neutralRuntimeDoctor(provider: string): AgentRuntimeDoctorResult {
+  return {
+    ok: true,
+    detail: `runtime provider ${provider} reports no host-managed diagnostics`,
+    errors: [],
+  };
 }
 
 async function getServiceStatus(options: DoctorOptions): Promise<ServiceStatus> {
@@ -390,6 +421,7 @@ async function addManagedServiceLaunchChecks(
   service: ServiceStatus,
   runner: CommandRunner,
   probe: ServiceNodeProbe,
+  catalog: AgentRuntimeProviderCatalog,
   dispatchers: DispatcherConfig[],
 ): Promise<void> {
   if (!service.installed) return;
@@ -442,35 +474,58 @@ async function addManagedServiceLaunchChecks(
     ),
   );
 
-  // Each dispatcher's codex.bin (with the host-level env override applied) must
-  // launch under the unit's PATH. CODEX_HOST_CODEX_BIN in the unit env, when
-  // present, overrides every bin — preserving older units that still pin it.
-  const codexBins = [
-    ...new Set(dispatchers.map((d) => resolveCodexBin(d.codex.bin, serviceEnv))),
-  ];
-  if (codexBins.length === 0) codexBins.push(resolveCodexBin(DEFAULT_CODEX_BIN, serviceEnv));
-  for (const bin of codexBins) {
+  // Each dispatcher's provider-owned runtime binary must launch under the
+  // unit's PATH. CODEX_HOST_CODEX_BIN, when present, still overrides every
+  // Codex bin to preserve older units that pinned it.
+  for (const check of runtimeBinaryChecks(catalog, dispatchers, serviceEnv, true)) {
     checks.push(
       await checkHelpLaunch(
-        'managed service Codex binary',
-        bin,
-        ['--help'],
+        check.name,
+        check.bin,
+        check.args,
         serviceEnv,
         runner,
-        'codex binary is not set; check dispatchers[].codex.bin',
+        'runtime binary is not set; check the agents[] entry the dispatcher references',
       ),
     );
   }
 }
 
-/**
- * Codex binary for one dispatcher: the `CODEX_HOST_CODEX_BIN` env override (a
- * deliberate host-level setting) wins; otherwise the dispatcher's `codex.bin`.
- * Mirrors `Server.resolveCodexBinPath` so doctor checks what serve will run.
- */
-function resolveCodexBin(dispatcherBin: string, env: NodeJS.ProcessEnv): string {
-  const override = env['CODEX_HOST_CODEX_BIN'];
-  return override !== undefined && override.trim() !== '' ? override : dispatcherBin;
+function runtimeBinaryChecks(
+  catalog: AgentRuntimeProviderCatalog,
+  dispatchers: DispatcherConfig[],
+  env: NodeJS.ProcessEnv,
+  managedService = false,
+): RuntimeBinaryCheck[] {
+  const checks = new Map<string, RuntimeBinaryCheck>();
+  const add = (check: RuntimeBinaryCheck): void => {
+    checks.set(`${check.name}\0${check.bin}\0${check.args.join('\0')}`, check);
+  };
+
+  if (dispatchers.length === 0) {
+    // Residual: with no dispatcher there is no agents[] entry to drive a provider
+    // diagnostic, so the default codex bin check is constructed directly here.
+    // This is the one codex-specific edge in core doctor (near-zero, not zero):
+    // de-leaking it would require a "default provider for empty config" concept.
+    add({
+      name: managedService ? 'managed service Codex binary' : 'codex binary',
+      bin: resolveCodexBinPath(DEFAULT_CODEX_BIN, env),
+      args: ['--help'],
+    });
+    return [...checks.values()];
+  }
+
+  const scope: AgentRuntimeDiagnosticContext['scope'] = managedService
+    ? 'managedService'
+    : 'foreground';
+  for (const dispatcher of dispatchers) {
+    const diagnostic = catalog.resolve(dispatcher.runtime.provider).diagnostic;
+    if (diagnostic === undefined) continue;
+    for (const check of diagnostic.binChecks({ dispatcher, env, scope })) {
+      add(check);
+    }
+  }
+  return [...checks.values()];
 }
 
 async function checkNodeLaunch(
@@ -701,20 +756,20 @@ function parsePositiveInt(value: string | undefined): number | null {
 }
 
 function printDispatcherDoctor(dispatcher: DispatcherDoctorReport): void {
-  printCodexHomeDoctor(`dispatcher ${dispatcher.id} foreground`, dispatcher.foreground);
+  printRuntimeDoctor(`dispatcher ${dispatcher.id} foreground`, dispatcher.foreground);
   if (dispatcher.managedService !== null) {
-    printCodexHomeDoctor(
+    printRuntimeDoctor(
       `dispatcher ${dispatcher.id} managed-service`,
       dispatcher.managedService,
     );
   }
 }
 
-function printCodexHomeDoctor(
+function printRuntimeDoctor(
   name: string,
-  result: DispatcherCodexHomeDoctorResult,
+  result: AgentRuntimeDoctorResult,
 ): void {
-  console.log(`${result.ok ? 'ok' : 'fail'}\t${name}\t${result.context.codexHome}`);
+  console.log(`${result.ok ? 'ok' : 'fail'}\t${name}\t${result.detail}`);
   for (const error of result.errors) {
     console.log(`fail\t${name}\t${error}`);
   }
