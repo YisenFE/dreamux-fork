@@ -156,18 +156,13 @@ function teammateTools(
       limit: { type: 'integer', minimum: 1, maximum: 100 },
       cursor: { type: 'string', minLength: 1, maxLength: 1000 },
     }, []),
-    tool('history_events', 'Read the raw forward-only event timeline for one TeamMate.', {
+    tool('list', 'List this dispatcher\'s TeamMate identities (concrete name, display name, status, repo/cwd/session essentials).', {}, []),
+    tool('status', 'Read one TeamMate identity and live runtime status by its concrete name.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
     }, ['name']),
-    tool('list', 'List this dispatcher\'s TeamMate identities.', {}, []),
-    tool('status', 'Read one TeamMate identity and live runtime status.', {
+    tool('last', 'Read a TeamMate\'s most recent settled turn(s) from the durable session ledger by concrete name. Works for a closed/stopped TeamMate without starting a runtime; this is the fallback when a completion was not delivered. turns defaults to 1 (range 1..5); the newest turn is last.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
-    }, ['name']),
-    tool('last', 'Read the last visible result reported by one TeamMate runtime.', {
-      name: { type: 'string', minLength: 1, maxLength: 64 },
-    }, ['name']),
-    tool('ctx', 'Read one TeamMate runtime context-window snapshot.', {
-      name: { type: 'string', minLength: 1, maxLength: 64 },
+      turns: { type: 'integer', minimum: 1, maximum: 5 },
     }, ['name']),
     tool('get_capabilities', 'List TeamMate verbs and spawnable agent runtime ids.', {}, []),
   ];
@@ -180,7 +175,7 @@ function teammateTools(
       description:
         'Spawnable agents[].id returned by get_capabilities.agent_runtimes[].id.',
     },
-    intent: { type: 'string', maxLength: 2000 },
+    intent: { type: 'string', minLength: 1, maxLength: 2000 },
   };
   if (callerKind === 'dispatcher') {
     spawnProperties['cwd'] = { type: 'string', minLength: 1, maxLength: 4096 };
@@ -200,18 +195,21 @@ function teammateTools(
   return [
     tool(
       'spawn',
-      'Start a named, resumable TeamMate agent and submit its first turn. Use get_capabilities.agent_runtimes[].id as agent_runtime.',
+      'Start a named, resumable TeamMate agent and submit its first turn. Use get_capabilities.agent_runtimes[].id as agent_runtime. intent is required: it is the durable recovery subject for the session ledger.',
       spawnProperties,
-      callerKind === 'team_leader' ? ['name', 'prompt'] : ['name', 'prompt', 'cwd'],
+      callerKind === 'team_leader'
+        ? ['name', 'prompt', 'intent']
+        : ['name', 'prompt', 'cwd', 'intent'],
     ),
-    tool('send', 'Send a turn to a TeamMate agent; reopens a closed one from its checkpoint first.', {
+    tool('send', 'Send a turn to a TeamMate agent; reopens a closed one from its checkpoint first. Pass intent to update the recorded recovery subject before the turn.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
       prompt: { type: 'string', minLength: 1, maxLength: 20000 },
+      intent: { type: 'string', minLength: 1, maxLength: 2000 },
     }, ['name', 'prompt']),
-    tool('close', 'Close a named TeamMate agent and retain its history; send reopens it later.', {
+    tool('close', 'Close a named TeamMate agent and retain its history; send reopens it later. note is required: it records why a recoverable session was stopped.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
-      note: { type: 'string', maxLength: 2000 },
-    }, ['name']),
+      note: { type: 'string', minLength: 1, maxLength: 2000 },
+    }, ['name', 'note']),
     ...readTools,
   ];
 }
@@ -283,16 +281,12 @@ function mapToolCall(
       return { method: 'mcp.teammate.close', params: closeArgs(call.arguments) };
     case 'history':
       return { method: 'mcp.teammate.history', params: historyArgs(call.arguments) };
-    case 'history_events':
-      return { method: 'mcp.teammate.history_events', params: nameArgs(call.arguments) };
     case 'list':
       return { method: 'mcp.teammate.list', params: {} };
     case 'status':
       return { method: 'mcp.teammate.status', params: nameArgs(call.arguments) };
     case 'last':
-      return { method: 'mcp.teammate.last', params: nameArgs(call.arguments) };
-    case 'ctx':
-      return { method: 'mcp.teammate.ctx', params: nameArgs(call.arguments) };
+      return { method: 'mcp.teammate.last', params: lastArgs(call.arguments) };
     case 'get_capabilities':
       return { method: 'mcp.teammate.capabilities', params: {} };
     default:
@@ -351,13 +345,14 @@ function spawnArgs(
 ): Record<string, unknown> {
   const obj = asRecord(value, 'spawn arguments');
   const agentRuntime = optionalString(obj, 'agent_runtime');
-  const intent = optionalString(obj, 'intent');
+  // Required recovery subject (issue #182 PR-3).
+  const intent = requireString(obj, 'intent');
   if (callerKind === 'team_leader') {
     return {
       name: requireString(obj, 'name'),
       prompt: requireString(obj, 'prompt'),
+      intent,
       ...(agentRuntime !== null ? { agent_runtime: agentRuntime } : {}),
-      ...(intent !== null ? { intent } : {}),
     };
   }
   const worktree = optionalWorktree(obj, 'worktree');
@@ -365,9 +360,9 @@ function spawnArgs(
     name: requireString(obj, 'name'),
     prompt: requireString(obj, 'prompt'),
     cwd: requireString(obj, 'cwd'),
+    intent,
     ...(agentRuntime !== null ? { agent_runtime: agentRuntime } : {}),
     ...(worktree !== null ? { worktree } : {}),
-    ...(intent !== null ? { intent } : {}),
   };
 }
 
@@ -409,18 +404,22 @@ function optionalProp(
 
 function sendArgs(value: unknown): Record<string, unknown> {
   const obj = asRecord(value, 'send arguments');
+  // Optional updated recovery subject (issue #182 PR-3). An empty string is
+  // treated as absent so it never wipes the recorded subject.
+  const intent = optionalString(obj, 'intent');
   return {
     name: requireString(obj, 'name'),
     prompt: requireString(obj, 'prompt'),
+    ...(intent !== null && intent !== '' ? { intent } : {}),
   };
 }
 
 function closeArgs(value: unknown): Record<string, unknown> {
   const obj = asRecord(value, 'close arguments');
-  const note = optionalString(obj, 'note');
+  // Required close reason (issue #182 PR-3).
   return {
     name: requireString(obj, 'name'),
-    ...(note !== null ? { note } : {}),
+    note: requireString(obj, 'note'),
   };
 }
 
@@ -460,6 +459,15 @@ function historyArgs(value: unknown): Record<string, unknown> {
 function nameArgs(value: unknown): Record<string, unknown> {
   const obj = asRecord(value, 'arguments');
   return { name: requireString(obj, 'name') };
+}
+
+function lastArgs(value: unknown): Record<string, unknown> {
+  const obj = asRecord(value, 'last arguments');
+  const turns = optionalInteger(obj, 'turns');
+  return {
+    name: requireString(obj, 'name'),
+    ...(turns !== null ? { turns } : {}),
+  };
 }
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {

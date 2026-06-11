@@ -32,10 +32,9 @@ import type {
 } from './teammate/types.js';
 import type {
   TeamBindChannelInput,
-  TeamCreateGroupInput,
   TeamCreateInput,
-  TeamCreateGroupResult,
   TeamDissolveInput,
+  TeamHistoryQuery,
   TeamTransferChannelBackInput,
 } from './team/types.js';
 
@@ -111,7 +110,6 @@ export class DispatcherService {
     });
     this.teams = new TeamService({
       teammates: this.teammates,
-      createFeishuGroup: (input) => this.dispatchers.createFeishuGroup(input),
     });
   }
 
@@ -230,16 +228,8 @@ export class DispatcherService {
     return this.teammates.history(input);
   }
 
-  getTeamMateHistoryEvents(dispatcherId: string, name: string) {
-    return this.teammates.historyEvents(dispatcherId, name);
-  }
-
-  getTeamMateLast(dispatcherId: string, name: string) {
-    return this.teammates.last(dispatcherId, name);
-  }
-
-  getTeamMateContext(dispatcherId: string, name: string) {
-    return this.teammates.context(dispatcherId, name);
+  getTeamMateLast(dispatcherId: string, name: string, turns?: number) {
+    return this.teammates.last(dispatcherId, name, turns);
   }
 
   getTeamMateCapabilities() {
@@ -250,16 +240,16 @@ export class DispatcherService {
     return this.teams.create(input);
   }
 
-  createTeamGroup(input: TeamCreateGroupInput): Promise<TeamCreateGroupResult> {
-    return this.teams.createGroup(input);
-  }
-
   listTeams(dispatcherId: string) {
     return this.teams.list(dispatcherId);
   }
 
   getTeamStatus(dispatcherId: string, teamId: string) {
     return this.teams.status(dispatcherId, teamId);
+  }
+
+  getTeamHistory(input: TeamHistoryQuery) {
+    return this.teams.history(input);
   }
 
   getTeamLedger(dispatcherId: string, teamId: string) {

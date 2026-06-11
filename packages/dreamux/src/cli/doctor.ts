@@ -37,6 +37,7 @@ import {
   setRuntimeConfig,
   stateRoot,
 } from '../platform/paths.js';
+import { diagnoseDispatcherWorkspace } from '../dispatcher-service/dispatcher-workspace.js';
 import { ExecaCommandRunner } from '../onboard/commands.js';
 import {
   defaultServiceNodeProbe,
@@ -128,6 +129,29 @@ export async function runDreamuxDoctor(
       name: check.name,
       ok: await runner.check(check.bin, check.args),
       detail: check.bin,
+    });
+  }
+
+  // Dispatcher workspace cwd contract (issue #182 PR-4): each ENABLED dispatcher
+  // must declare an explicit, usable `cwd` — no state-dir fallback. This mirrors
+  // `Server.assertDispatcherWorkspaces`, which enforces the contract only for
+  // enabled dispatchers (PR #186 review P3): a disabled dispatcher is never
+  // started, so its cwd is reported as a non-blocking diagnostic instead of a
+  // failure, keeping doctor and `dreamux serve` on the same contract.
+  for (const dispatcher of config.dispatchers) {
+    if (dispatcher.enabled === false) {
+      checks.push({
+        name: `dispatcher ${dispatcher.id} workspace`,
+        ok: true,
+        detail: 'disabled; workspace cwd contract not enforced',
+      });
+      continue;
+    }
+    const diagnosis = await diagnoseDispatcherWorkspace(config, dispatcher.id);
+    checks.push({
+      name: `dispatcher ${dispatcher.id} workspace`,
+      ok: diagnosis.ok,
+      detail: diagnosis.detail,
     });
   }
 

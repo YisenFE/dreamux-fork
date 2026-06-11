@@ -36,10 +36,15 @@ import {
   createLogger,
   type DreamuxLogger,
 } from './platform/logger.js';
-import { createAdminSocketServer, type AdminSocketServer } from './admin/socket.js';
+import {
+  assertNoLegacyAdminServer,
+  createAdminSocketServer,
+  type AdminSocketServer,
+} from './admin/socket.js';
 import { RestartIntentConsumer } from './daemon/restart-intent.js';
 import type { ClaudeCodeSessionFactory } from './agent-runtime/builtin/claude-code/supervisor.js';
 import { DispatcherService } from './dispatcher-service/service.js';
+import { ensureDispatcherWorkspace } from './dispatcher-service/dispatcher-workspace.js';
 export {
   IN_PROGRESS_REACTION_EMOJI,
   RECEIVED_REACTION_EMOJI,
@@ -91,6 +96,23 @@ export interface ServerOptions {
    * CLI injects a factory that writes `logs/feishu-channel/<id>.log`.
    */
   channelLoggerFactory?: (dispatcherId: string) => DreamuxLogger;
+  /**
+   * Optional sweep of the volatile runtime-socket dirs (issue #182), run once
+   * after the admin-socket lock is held (single-server guarantee — every
+   * leftover socket is a dead crash orphan) and before any dispatcher starts.
+   * The CLI injects the real `sweepRuntimeSocketDirs`; tests and embedded
+   * servers omit it so they never touch the operator's run root. Returns the
+   * swept directories for logging.
+   */
+  runtimeSocketSweep?: () => Promise<string[]>;
+  /**
+   * Pre-#182 admin lock path probed before binding the new admin socket, to
+   * detect a still-running OLD-version server (issue #182 PR-1, PR #183 review
+   * P1). The CLI injects the real legacy path (`state/admin.sock.lock`); tests
+   * and embedded servers omit it (skip the check) so they never read the
+   * operator's real state dir. Detection only — never removed or migrated.
+   */
+  legacyAdminLockPath?: string | null;
 }
 
 export interface Repos {
@@ -174,6 +196,22 @@ export class Server {
       }),
     );
 
+    // Dispatcher workspace cwd contract (issue #182 PR-4): every enabled
+    // dispatcher must declare an explicit, usable `cwd` — there is no fallback
+    // to a Dreamux state dir. Pre-flight all of them before taking the admin
+    // lock or launching anything, and fail the whole start loud (aggregated) so
+    // a misconfigured deployment never comes up half-broken.
+    await this.assertDispatcherWorkspaces();
+
+    // Before taking the new run/ admin lock, fail loud if an OLD-version
+    // server still holds the pre-#182 state/ admin lock — the two locks are at
+    // different paths and would not otherwise see each other (issue #182 P1).
+    if (this.opts.legacyAdminLockPath != null) {
+      await assertNoLegacyAdminServer({
+        legacyLockPath: this.opts.legacyAdminLockPath,
+      });
+    }
+
     this.admin = createAdminSocketServer(
       this,
       this.opts.adminSocketPath ?? adminSocketPath(),
@@ -183,6 +221,18 @@ export class Server {
       { admin_socket: this.admin.socketPath },
       'admin socket listening',
     );
+
+    if (this.opts.runtimeSocketSweep !== undefined) {
+      try {
+        const swept = await this.opts.runtimeSocketSweep();
+        this.log.info({ dirs: swept }, 'swept volatile runtime-socket dirs');
+      } catch (err) {
+        this.log.warn(
+          { err: errInfo(err) },
+          'runtime-socket sweep failed; continuing startup',
+        );
+      }
+    }
 
     const rows = this.repos.dispatchers.listEnabled();
     for (const row of rows) {
@@ -194,6 +244,30 @@ export class Server {
           'dispatcher failed to start',
         );
       }
+    }
+  }
+
+  /**
+   * Validate the workspace cwd of every enabled dispatcher (issue #182 PR-4).
+   * Aggregates all failures into one loud error so the operator sees every
+   * misconfigured dispatcher at once, rather than fixing them one boot at a
+   * time. A throw here aborts `start()` before any socket or dispatcher.
+   */
+  private async assertDispatcherWorkspaces(): Promise<void> {
+    const config = this.opts.config ?? BUILT_IN_DEFAULTS;
+    const failures: string[] = [];
+    for (const row of this.repos.dispatchers.listEnabled()) {
+      try {
+        await ensureDispatcherWorkspace(config, row.dispatcher_id);
+      } catch (err) {
+        failures.push(err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(
+        `dreamux serve cannot start — dispatcher workspace cwd contract failed:\n` +
+          failures.map((message) => `  - ${message}`).join('\n'),
+      );
     }
   }
 

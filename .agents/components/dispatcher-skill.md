@@ -5,20 +5,28 @@ ships in the npm package:
 
 - `dispatcher` teaches dispatcher app-server sessions how to delegate product
   work to TeamMates. The default interface is the server-hosted TeamMate MCP:
-  `spawn` creates a named semi-resident TeamMate, `send` submits follow-up
-  turns (and reopens a closed TeamMate from its persisted checkpoint — there is
-  no standalone dispatcher-facing `resume` verb; #155), and `close` stops one.
-  `history` returns session ledger rows, `history_events` returns one raw
-  per-TeamMate timeline, and `list`/`status`/`last`/`ctx`/`get_capabilities`
-  read and recover state without polling. The `tm` CLI is the explicit fallback
-  for legacy diagnostics
+  `spawn` creates a semi-resident TeamMate and returns its concrete, never-reused
+  name (issue #188 — the requested `name` is only a base slug / `display_name`;
+  all later calls use the returned name), `send` submits follow-up turns (and
+  reopens a closed TeamMate from its persisted checkpoint — there is no
+  standalone dispatcher-facing `resume` verb; #155), and `close` stops one.
+  `history` is the durable session-ledger search surface, `last` reads a
+  TeamMate's most recent settled turn(s) (`turns` 1..5) from that ledger by
+  concrete name — working even for a closed TeamMate without starting a runtime —
+  and `list`/`status`/`get_capabilities` read state without polling. The obsolete
+  `ctx` and `history_events` verbs were removed (issue #188). The `tm` CLI is the
+  explicit fallback for legacy diagnostics
   ([provider architecture realignment](../decisions/provider-architecture-realignment.md)).
 - `team-dev-workflow` covers multi-teammate review, design, merge, and unblock
   coordination.
-- `team` MCP is injected for dispatcher-only Team Mode lifecycle: create a
-  TeamLeader, create and bind a Feishu group from a P2P control request, read
-  Team status/ledger, bind or transfer back Feishu group channels, and dissolve
-  a Team. TeamLeader member work still uses the caller-scoped TeamMate MCP.
+- `team` MCP is injected for dispatcher-only Team Mode lifecycle, addressed by
+  Team name (issue #182 PR-7/PR-8): `create` a TeamLeader (optionally binding an
+  EXISTING Feishu group via `bind_group: { chat_id }`), inspect with `list`
+  (compact rows) / `status` (one Team's detail incl. active bound group) /
+  `history` (filterable recovery search), `bind_group` an existing group or
+  `transfer_channel_back`, and `dissolve` a Team. The `create_group`
+  (create-a-new-group) and raw `ledger` verbs were retired. TeamLeader member
+  work still uses the caller-scoped TeamMate MCP.
 - `dreamux-maintenance` covers installed Dreamux diagnosis and safe operation.
 
 They are not installed through Codex plugin marketplaces. `dreamux onboard` and
@@ -49,9 +57,9 @@ supersedes the older dispatcher/tm boundary for server-owned TeamMate state.
 Two state owners are kept distinct in the skill:
 
 - The Dreamux server owns TeamMate **agent state** behind the injected
-  dispatcher-scoped `teammate` MCP — identities, runtime checkpoints, statuses,
-  session ledger rows, raw per-TeamMate event history, last result, and context
-  snapshots under
+  dispatcher-scoped `teammate` MCP — concrete identities (with their requested
+  `display_name`), runtime checkpoints, statuses, and the durable session ledger
+  (prompts plus the captured final assistant output that `last` returns) under
   `~/.dreamux/state/<dispatcher-id>/teammate/`.
 - The Dreamux server owns Team **lifecycle state** behind the injected
   dispatcher-scoped `team` MCP under `~/.dreamux/state/<dispatcher-id>/team/`.

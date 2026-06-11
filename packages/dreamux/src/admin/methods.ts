@@ -149,17 +149,18 @@ export const adminMethods: Record<string, AdminHandler> = {
       caller.kind === 'team_leader'
         ? await server.dispatcherService.teams.sharedWorkspace(id, caller.teamId)
         : undefined;
-    const intent = optionalString(params, 'intent');
+    // Required recovery subject (issue #182 PR-3).
+    const intent = mustNonEmptyString(params, 'intent');
     try {
       return await server.dispatcherService.teammates.spawnScoped({
         principal: caller,
         name,
         prompt,
+        intent,
         ...(sharedWorkspace !== undefined ? { sharedWorkspace } : {}),
         ...(cwd !== null ? { cwd } : {}),
         ...(agentRuntime !== null ? { agentRuntime } : {}),
         ...(worktree !== null ? { worktree } : {}),
-        ...(intent !== null ? { intent } : {}),
       });
     } catch (err) {
       throw new AdminError('TEAMMATE_SPAWN_FAILED', parseMessage(err));
@@ -172,11 +173,15 @@ export const adminMethods: Record<string, AdminHandler> = {
     const caller = callerPrincipal(id, params);
     const name = mustString(params, 'name');
     const prompt = mustString(params, 'prompt');
+    // Optional: when supplied, updates the recorded recovery subject before the
+    // turn (issue #182 PR-3).
+    const intent = optionalString(params, 'intent');
     try {
       return await server.dispatcherService.teammates.sendScoped({
         principal: caller,
         name,
         prompt,
+        ...(intent !== null ? { intent } : {}),
       });
     } catch (err) {
       throw new AdminError('TEAMMATE_SEND_FAILED', parseMessage(err));
@@ -188,12 +193,13 @@ export const adminMethods: Record<string, AdminHandler> = {
     mustExistingDispatcher(server, id);
     const caller = callerPrincipal(id, params);
     const name = mustString(params, 'name');
-    const note = optionalString(params, 'note');
+    // Required close reason (issue #182 PR-3).
+    const note = mustNonEmptyString(params, 'note');
     try {
       return await server.dispatcherService.teammates.closeScoped({
         principal: caller,
         name,
-        ...(note !== null ? { note } : {}),
+        note,
       });
     } catch (err) {
       throw new AdminError('TEAMMATE_CLOSE_FAILED', parseMessage(err));
@@ -208,14 +214,6 @@ export const adminMethods: Record<string, AdminHandler> = {
       principal: callerPrincipal(id, params),
       ...historyQuery(params),
     });
-  },
-
-  'mcp.teammate.history_events': async (server, params) => {
-    const id = mustDispatcherId(params);
-    mustExistingDispatcher(server, id);
-    const caller = callerPrincipal(id, params);
-    const name = mustString(params, 'name');
-    return server.dispatcherService.teammates.historyEventsScoped(caller, name);
   },
 
   'mcp.teammate.list': async (server, params) => {
@@ -244,19 +242,11 @@ export const adminMethods: Record<string, AdminHandler> = {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
     const name = mustString(params, 'name');
+    const turns = optionalInteger(params, 'turns');
     return server.dispatcherService.teammates.lastScoped(
       callerPrincipal(id, params),
       name,
-    );
-  },
-
-  'mcp.teammate.ctx': async (server, params) => {
-    const id = mustDispatcherId(params);
-    mustExistingDispatcher(server, id);
-    const name = mustString(params, 'name');
-    return server.dispatcherService.teammates.contextScoped(
-      callerPrincipal(id, params),
-      name,
+      turns ?? undefined,
     );
   },
 
@@ -270,17 +260,20 @@ export const adminMethods: Record<string, AdminHandler> = {
     const repoCwd = mustString(params, 'repo_cwd');
     const leaderAgentRuntime = mustString(params, 'leader_agent_runtime');
     const worktree = optionalWorktreeRequest(params, 'worktree');
-    const intent = optionalString(params, 'intent');
+    // Required recovery subject (issue #182 PR-3).
+    const intent = mustNonEmptyString(params, 'intent');
     const prompt = optionalString(params, 'prompt');
+    const bindGroup = optionalBindGroup(params, 'bind_group');
     try {
       return await server.dispatcherService.createTeam({
         dispatcherId: id,
         name,
         repoCwd,
         leaderAgentRuntime,
+        intent,
         ...(worktree !== null ? { worktree } : {}),
-        ...(intent !== null ? { intent } : {}),
         ...(prompt !== null ? { prompt } : {}),
+        ...(bindGroup !== null ? { bindGroup } : {}),
       });
     } catch (err) {
       throw new AdminError('TEAM_CREATE_FAILED', parseMessage(err));
@@ -296,44 +289,48 @@ export const adminMethods: Record<string, AdminHandler> = {
   'mcp.team.status': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    const teamId = mustString(params, 'team_id');
-    return server.dispatcherService.getTeamStatus(id, teamId);
+    // #182 PR-7: public addressing is by `name` (== team_id storage key).
+    const name = mustString(params, 'name');
+    return server.dispatcherService.getTeamStatus(id, name);
   },
 
-  'mcp.team.ledger': async (server, params) => {
+  'mcp.team.history': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    const teamId = mustString(params, 'team_id');
-    return server.dispatcherService.getTeamLedger(id, teamId);
-  },
-
-  'mcp.team.bind_channel': async (server, params) => {
-    const id = mustDispatcherId(params);
-    mustExistingDispatcher(server, id);
-    return server.dispatcherService.bindTeamChannel({
+    const name = optionalString(params, 'name');
+    const status = optionalTeamStatus(params, 'status');
+    const closeStatus = optionalCloseStatus(params, 'close_status');
+    const repo = optionalString(params, 'repo');
+    const grep = optionalString(params, 'grep');
+    const since = optionalInteger(params, 'since');
+    const until = optionalInteger(params, 'until');
+    const limit = optionalInteger(params, 'limit');
+    const cursor = optionalString(params, 'cursor');
+    return server.dispatcherService.getTeamHistory({
       dispatcherId: id,
-      teamId: mustString(params, 'team_id'),
-      provider: 'builtin:feishu',
-      chatId: mustString(params, 'chat_id'),
-      chatType: mustString(params, 'chat_type') === 'group' ? 'group' : 'p2p',
+      ...(name !== null ? { name } : {}),
+      ...(status !== null ? { status } : {}),
+      ...(closeStatus !== null ? { closeStatus } : {}),
+      ...(repo !== null ? { repo } : {}),
+      ...(grep !== null ? { grep } : {}),
+      ...(since !== null ? { since } : {}),
+      ...(until !== null ? { until } : {}),
+      ...(limit !== null ? { limit } : {}),
+      ...(cursor !== null ? { cursor } : {}),
     });
   },
 
-  'mcp.team.create_group': async (server, params) => {
+  'mcp.team.bind_group': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    return server.dispatcherService.createTeamGroup({
+    // #182 PR-7: bindings are always Feishu group chats; the public surface no
+    // longer takes `chat_type` (the store rejects non-group for Team binding).
+    return server.dispatcherService.bindTeamChannel({
       dispatcherId: id,
-      name: mustString(params, 'name'),
-      repoCwd: mustString(params, 'repo_cwd'),
-      leaderAgentRuntime: mustString(params, 'leader_agent_runtime'),
-      sourceChatId: mustString(params, 'source_chat_id'),
-      sourceChatType: mustString(params, 'source_chat_type') === 'p2p' ? 'p2p' : 'group',
-      requesterOpenId: mustString(params, 'requester_open_id'),
-      ...optionalMappedStringProp(params ?? {}, 'group_name', 'groupName'),
-      ...optionalStringProp(params ?? {}, 'intent'),
-      ...optionalStringProp(params ?? {}, 'prompt'),
-      inviteOpenIds: optionalStringArray(params, 'invite_open_ids') ?? [],
+      teamId: mustString(params, 'name'),
+      provider: 'builtin:feishu',
+      chatId: mustString(params, 'chat_id'),
+      chatType: 'group',
     });
   },
 
@@ -345,7 +342,8 @@ export const adminMethods: Record<string, AdminHandler> = {
         dispatcherId: id,
         provider: 'builtin:feishu',
         chatId: mustString(params, 'chat_id'),
-        chatType: mustString(params, 'chat_type') === 'group' ? 'group' : 'p2p',
+        // #182 PR-7: group-only; the public surface no longer takes `chat_type`.
+        chatType: 'group',
       }),
     };
   },
@@ -353,12 +351,13 @@ export const adminMethods: Record<string, AdminHandler> = {
   'mcp.team.dissolve': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    const teamId = mustString(params, 'team_id');
-    const note = optionalString(params, 'note');
+    const name = mustString(params, 'name');
+    // Required dissolve reason (issue #182 PR-3).
+    const note = mustNonEmptyString(params, 'note');
     return server.dispatcherService.dissolveTeam({
       dispatcherId: id,
-      teamId,
-      ...(note !== null ? { note } : {}),
+      teamId: name,
+      note,
     });
   },
 };
@@ -432,6 +431,23 @@ function mustString(
     throw new AdminError('BAD_REQUEST', `missing or non-string param '${key}'`);
   }
   return params[key] as string;
+}
+
+/**
+ * Like `mustString` but rejects the empty string too — the admin-layer guard
+ * for required, meaningful fields (issue #182 PR-3 intent/note). Matches the
+ * shim's `requireString` so an empty required field is rejected at every layer,
+ * including a direct admin caller that bypasses the shim.
+ */
+function mustNonEmptyString(
+  params: Record<string, unknown> | undefined,
+  key: string,
+): string {
+  const value = mustString(params, key);
+  if (value === '') {
+    throw new AdminError('BAD_REQUEST', `param '${key}' must be a non-empty string`);
+  }
+  return value;
 }
 
 function mustDispatcherId(
@@ -556,6 +572,36 @@ function optionalCloseStatus(
   throw new AdminError('BAD_REQUEST', `param '${key}' must be open or closed`);
 }
 
+function optionalBindGroup(
+  params: Record<string, unknown> | undefined,
+  key: string,
+): { chatId: string } | null {
+  if (params === undefined) return null;
+  const value = params[key];
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new AdminError('BAD_REQUEST', `param '${key}' must be an object`);
+  }
+  const chatId = (value as Record<string, unknown>)['chat_id'];
+  if (typeof chatId !== 'string' || chatId === '') {
+    throw new AdminError('BAD_REQUEST', `param '${key}.chat_id' must be a non-empty string`);
+  }
+  return { chatId };
+}
+
+function optionalTeamStatus(
+  params: Record<string, unknown> | undefined,
+  key: string,
+): 'starting' | 'running' | 'closed' | null {
+  const value = optionalString(params, key);
+  if (value === null) return null;
+  if (value === 'starting' || value === 'running' || value === 'closed') return value;
+  throw new AdminError(
+    'BAD_REQUEST',
+    `param '${key}' must be starting, running, or closed`,
+  );
+}
+
 function optionalInteger(
   params: Record<string, unknown> | undefined,
   key: string,
@@ -569,34 +615,12 @@ function optionalInteger(
   return value as number;
 }
 
-function optionalStringArray(
-  params: Record<string, unknown> | undefined,
-  key: string,
-): string[] | null {
-  if (params === undefined) return null;
-  const value = params[key];
-  if (value === undefined || value === null) return null;
-  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
-    throw new AdminError('BAD_REQUEST', `param '${key}' must be an array of strings`);
-  }
-  return value as string[];
-}
-
 function optionalStringProp(
   params: Record<string, unknown>,
   key: string,
 ): Record<string, string> {
   const value = optionalString(params, key);
   return value === null ? {} : { [key]: value };
-}
-
-function optionalMappedStringProp(
-  params: Record<string, unknown>,
-  key: string,
-  targetKey: string,
-): Record<string, string> {
-  const value = optionalString(params, key);
-  return value === null ? {} : { [targetKey]: value };
 }
 
 function mustExistingDispatcher(server: Server, id: string): void {

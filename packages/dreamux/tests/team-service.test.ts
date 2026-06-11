@@ -13,7 +13,7 @@ import { teamLeaderPrincipal } from '../src/dispatcher-service/teammate/types.js
 import { DispatcherStore } from '../src/state/dispatcher-store.js';
 import { resetRuntimeConfig } from '../src/platform/paths.js';
 import { createBuiltinProviderRegistry } from '../src/registry/index.js';
-import { testDreamuxConfig } from './helpers/config.js';
+import { testDispatcherConfig, testDreamuxConfig } from './helpers/config.js';
 import type {
   AgentRuntime,
   AgentRuntimeCapabilities,
@@ -113,14 +113,15 @@ class FakeProvider implements AgentRuntimeProvider {
   }
 }
 
+/** The dispatcher workspace cwd for the current test; set in beforeEach. */
+let dispatcherCwd: string;
+
 function buildServices(): {
   teams: TeamService;
   teammates: TeamMateAgentService;
   provider: FakeProvider;
-  createdGroups: Array<{ name: string; userOpenIds: string[]; chatId: string }>;
-  setCreateGroupError(err: Error | null): void;
 } {
-  const config = testDreamuxConfig();
+  const config = testDreamuxConfig([testDispatcherConfig({ cwd: dispatcherCwd })]);
   const registry = createBuiltinProviderRegistry();
   const descriptor = registry.resolve('builtin:codex');
   const provider = new FakeProvider(descriptor);
@@ -131,26 +132,8 @@ function buildServices(): {
     agentRuntimeProviders: new AgentRuntimeProviderCatalog({ registry }),
     log: noopLog(),
   });
-  const createdGroups: Array<{ name: string; userOpenIds: string[]; chatId: string }> = [];
-  let createGroupError: Error | null = null;
-  const teams = new TeamService({
-    teammates,
-    createFeishuGroup: async (input) => {
-      if (createGroupError !== null) throw createGroupError;
-      const chatId = `fake_group_${createdGroups.length + 1}`;
-      createdGroups.push({ name: input.name, userOpenIds: input.userOpenIds, chatId });
-      return { chatId };
-    },
-  });
-  return {
-    teams,
-    teammates,
-    provider,
-    createdGroups,
-    setCreateGroupError(err): void {
-      createGroupError = err;
-    },
-  };
+  const teams = new TeamService({ teammates });
+  return { teams, teammates, provider };
 }
 
 describe('TeamService', () => {
@@ -164,6 +147,10 @@ describe('TeamService', () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), 'dreamux-team-')));
     previousHome = process.env['HOME'];
     process.env['HOME'] = join(root, 'home');
+    // The dispatcher workspace cwd contract (issue #182 PR-4) requires an
+    // explicit, non-`~/.dreamux` workspace; managed team worktrees land under
+    // `<workspace>/.workspace/worktree/...`.
+    dispatcherCwd = join(root, 'workspace');
     resetRuntimeConfig();
   });
 
@@ -186,22 +173,36 @@ describe('TeamService', () => {
       intent: 'ship alpha',
     });
 
+    // #188: the Team's leader_name is a concrete, never-reused `tl-` name; the
+    // human-readable `${teamId}-leader` survives only as the leader display name.
+    expect(created.team.leader_name).toMatch(/^tl-alpha-[a-z0-9]{8}$/);
     expect(created.team).toMatchObject({
       team_id: 'alpha',
-      leader_name: 'alpha-leader',
       leader_agent_runtime: 'flow',
       status: 'running',
       repo_cwd: repo,
       source_repo: repo,
     });
     expect(created.leader).toMatchObject({
-      name: 'alpha-leader',
+      name: created.team.leader_name,
+      display_name: 'alpha-leader',
       role: 'team_leader',
       owner: { kind: 'dispatcher', dispatcher_id: 'flow' },
       team_id: 'alpha',
     });
     expect(existsSync(created.team.runtime_cwd)).toBe(true);
-    expect((await teams.list('flow')).map((entry) => entry.team.team_id)).toEqual(['alpha']);
+    // Required intent (issue #182 PR-3) is persisted on the Team record.
+    expect(created.team.intent).toBe('ship alpha');
+    // #182 PR-7: list returns compact scan rows (name == team_id), not summaries.
+    const listed = await teams.list('flow');
+    expect(listed.map((entry) => entry.name)).toEqual(['alpha']);
+    expect(listed[0]).toMatchObject({
+      team_id: 'alpha',
+      status: 'running',
+      leader_name: created.team.leader_name,
+      member_count: 0,
+      bound_group: null,
+    });
     expect((await teams.ledger('flow', 'alpha')).events.map((event) => event.type)).toEqual(['create']);
 
     const reloaded = new TeamService({ teammates });
@@ -213,9 +214,156 @@ describe('TeamService', () => {
       note: 'done',
     });
     expect(dissolved.team.status).toBe('closed');
+    expect(dissolved.team.close_note).toBe('done');
     expect(dissolved.leader?.status).toBe('closed');
-    expect((await reloaded.ledger('flow', 'alpha')).events.map((event) => event.type))
-      .toEqual(['create', 'dissolve']);
+    const ledger = (await reloaded.ledger('flow', 'alpha')).events;
+    expect(ledger.map((event) => event.type)).toEqual(['create', 'dissolve']);
+    // Required dissolve note (issue #182 PR-3) is the ledger summary — no
+    // synthetic 'team dissolved' fallback.
+    expect(ledger.find((e) => e.type === 'dissolve')?.summary).toBe('done');
+  });
+
+  it('captures a bound-channel TeamLeader turn in the session ledger (#182 PR-5, PR#187 P1)', async () => {
+    const repo = await initGitRepo(join(root, 'channel-repo'));
+    const { teams, teammates } = buildServices();
+
+    const created = await teams.create({
+      dispatcherId: 'flow',
+      name: 'alpha',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'ship alpha',
+    });
+    const leaderName = created.team.leader_name;
+
+    // A normal user turn delivered through a bound Team channel goes
+    // create -> routeChannelInput -> deliverToLeader -> channelInputScoped, which
+    // must now append a durable channel-origin turn (it previously recorded only
+    // the in-memory origin).
+    await teams.deliverToLeader({
+      dispatcherId: 'flow',
+      teamId: 'alpha',
+      turn: { text: 'please review the auth change', sourceId: 'msg-1' },
+    });
+
+    const events = await teammates.sessions().read('flow');
+    const channelTurn = events.find((e) => e.turn_origin === 'channel');
+    expect(channelTurn).toMatchObject({
+      type: 'send',
+      name: leaderName,
+      display_name: 'alpha-leader',
+      role: 'team_leader',
+      team_id: 'alpha',
+      leader_name: leaderName,
+      turn_origin: 'channel',
+      prompt_preview: 'please review the auth change',
+    });
+    // Carries a stable session id (same as the leader's spawn), never re-keyed.
+    expect(channelTurn?.session_id).toBe(
+      events.find((e) => e.type === 'spawn' && e.name === leaderName)?.session_id,
+    );
+  });
+
+  it('recreating a closed Team persists the new create.intent (#182 PR-3 P1)', async () => {
+    const repo = await initGitRepo(join(root, 'reuse-repo'));
+    const { teams, teammates } = buildServices();
+
+    const first = await teams.create({
+      dispatcherId: 'flow',
+      name: 'alpha',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'first intent',
+    });
+    expect(first.team.intent).toBe('first intent');
+    await teams.dissolve({ dispatcherId: 'flow', teamId: 'alpha', note: 'done' });
+
+    // Reusing the closed record must adopt the NEW intent, not keep the old one
+    // (the store.update path previously could not write intent).
+    const second = await teams.create({
+      dispatcherId: 'flow',
+      name: 'alpha',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'second intent',
+    });
+    expect(second.team.intent).toBe('second intent');
+    // And the durable record (reloaded from disk) carries the new intent.
+    const reloaded = new TeamService({ teammates });
+    expect((await reloaded.status('flow', 'alpha')).team.intent).toBe('second intent');
+  });
+
+  it('recreating a closed Team allocates a fresh leader name + session — never reuses (#188 P1)', async () => {
+    const repo = await initGitRepo(join(root, 'recreate-leader-repo'));
+    const { teams, teammates } = buildServices();
+
+    const first = await teams.create({
+      dispatcherId: 'flow',
+      name: 'alpha',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'first',
+    });
+    const firstLeader = first.team.leader_name;
+    const firstSession = first.leader.session_id;
+    expect(firstLeader).toMatch(/^tl-alpha-[a-z0-9]{8}$/);
+    expect(firstSession).not.toBeNull();
+    await teams.dissolve({ dispatcherId: 'flow', teamId: 'alpha', note: 'done' });
+
+    const second = await teams.create({
+      dispatcherId: 'flow',
+      name: 'alpha',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'second',
+    });
+    const secondLeader = second.team.leader_name;
+    // #188: a recreated closed Team gets a DISTINCT concrete leader name and a
+    // distinct session — the closed leader's concrete name is never reused.
+    expect(secondLeader).toMatch(/^tl-alpha-[a-z0-9]{8}$/);
+    expect(secondLeader).not.toBe(firstLeader);
+    expect(second.leader.name).toBe(secondLeader);
+    expect(second.leader.session_id).not.toBe(firstSession);
+
+    // The Team record (reloaded) routes/statuses on the NEW concrete leader name.
+    const reloaded = new TeamService({ teammates });
+    const status = await reloaded.status('flow', 'alpha');
+    expect(status.team.leader_name).toBe(secondLeader);
+    expect(status.leader?.name).toBe(secondLeader);
+
+    // Both leader identities persist; the old closed one is still addressable by
+    // its own concrete name (not reused, not deleted).
+    const oldLeader = await teammates.status('flow', firstLeader);
+    expect(oldLeader.status).toBe('closed');
+    expect(oldLeader.name).toBe(firstLeader);
+  });
+
+  it('rejects direct service create/dissolve with missing or empty intent/note (#182 PR-3 P1)', async () => {
+    const repo = await initGitRepo(join(root, 'svc-validate-repo'));
+    const { teams } = buildServices();
+
+    // create.intent required at the service boundary (in-process bypass).
+    await expect(
+      teams.create({
+        dispatcherId: 'flow',
+        name: 'novalidate',
+        repoCwd: repo,
+        leaderAgentRuntime: 'flow',
+        intent: '',
+      }),
+    ).rejects.toThrow(/Team create intent must be a non-empty string/);
+
+    // dissolve.note required at the service boundary, checked before lookup.
+    await teams.create({
+      dispatcherId: 'flow',
+      name: 'beta',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'work',
+    });
+    await expect(
+      teams.dissolve({ dispatcherId: 'flow', teamId: 'beta', note: '' }),
+    ).rejects.toThrow(/Team dissolve note must be a non-empty string/);
   });
 
   it('scopes TeamLeader member visibility to its own team', async () => {
@@ -224,157 +372,200 @@ describe('TeamService', () => {
     await teammates.spawn({
       dispatcherId: 'flow',
       name: 'solo',
+      intent: 'work',
       prompt: 'solo',
       cwd: root,
     });
-    await teams.create({
+    const alphaTeam = await teams.create({
       dispatcherId: 'flow',
       name: 'alpha',
+      intent: 'work',
       repoCwd: repo,
       leaderAgentRuntime: 'flow',
     });
-    await teams.create({
+    const betaTeam = await teams.create({
       dispatcherId: 'flow',
       name: 'beta',
+      intent: 'work',
       repoCwd: repo,
       leaderAgentRuntime: 'flow',
     });
 
+    // #188: principals carry the team's concrete leader_name, the same value the
+    // Team service stores and routes on.
     const alpha = teamLeaderPrincipal({
       dispatcherId: 'flow',
       teamId: 'alpha',
-      leaderName: 'alpha-leader',
+      leaderName: alphaTeam.team.leader_name,
     });
     const beta = teamLeaderPrincipal({
       dispatcherId: 'flow',
       teamId: 'beta',
-      leaderName: 'beta-leader',
+      leaderName: betaTeam.team.leader_name,
     });
     const workspace = await teams.sharedWorkspace('flow', 'alpha');
     const member = await teammates.spawnScoped({
       principal: alpha,
       name: 'builder',
+      intent: 'work',
       prompt: 'build',
       sharedWorkspace: workspace,
     });
+    const builderName = member.teammate.name;
+    // A Team member gets the `tm-` rule (#188).
+    expect(builderName).toMatch(/^tm-builder-[a-z0-9]{8}$/);
 
     expect(member.teammate).toMatchObject({
       role: 'team_member',
+      display_name: 'builder',
       owner: {
         kind: 'team',
         dispatcher_id: 'flow',
         team_id: 'alpha',
-        leader_name: 'alpha-leader',
+        leader_name: alphaTeam.team.leader_name,
       },
       runtime_cwd: workspace.runtimeCwd,
     });
     expect(provider.contexts.at(-1)?.cwd).toBe(workspace.runtimeCwd);
-    expect((await teammates.list('flow')).map((entry) => entry.name).sort())
+    // Dispatcher-scoped list sees the two leaders + the ungrouped teammate, by
+    // their display names (concrete names carry random suffixes).
+    expect((await teammates.list('flow')).map((entry) => entry.display_name).sort())
       .toEqual(['alpha-leader', 'beta-leader', 'solo']);
-    expect((await teammates.listScoped(alpha)).map((entry) => entry.name)).toEqual(['builder']);
+    expect((await teammates.listScoped(alpha)).map((entry) => entry.display_name)).toEqual(['builder']);
     expect(await teammates.listScoped(beta)).toEqual([]);
-    await expect(teammates.statusScoped(beta, 'builder')).rejects.toThrow(/does not exist/);
+    await expect(teammates.statusScoped(beta, builderName)).rejects.toThrow(/does not exist/);
     await expect(
-      teammates.sendScoped({ principal: beta, name: 'builder', prompt: 'nope' }),
+      teammates.sendScoped({ principal: beta, name: builderName, prompt: 'nope' }),
     ).rejects.toThrow(/does not exist/);
     await expect(
-      teammates.closeScoped({ principal: beta, name: 'builder' }),
+      teammates.closeScoped({ principal: beta, name: builderName, note: 'nope' }),
     ).rejects.toThrow(/does not exist/);
   });
 
-  it('creates a team group from P2P and binds the new group', async () => {
-    const repo = await initGitRepo(join(root, 'group-repo'));
-    const { teams, createdGroups } = buildServices();
+  it('create binds an existing Feishu group via bind_group (#182 PR-8)', async () => {
+    const repo = await initGitRepo(join(root, 'bindgroup-repo'));
+    const { teams } = buildServices();
 
-    const result = await teams.createGroup({
+    // #182 PR-8: the retired create_group is replaced by binding an EXISTING
+    // group at create time — no new Feishu group is created.
+    const result = await teams.create({
       dispatcherId: 'flow',
       name: 'gamma',
+      intent: 'work',
       repoCwd: repo,
       leaderAgentRuntime: 'flow',
-      sourceChatId: 'p2p_control',
-      sourceChatType: 'p2p',
-      requesterOpenId: 'ou_requester',
-      inviteOpenIds: ['ou_peer', 'ou_requester'],
-      groupName: 'Gamma Team',
+      bindGroup: { chatId: 'oc_existing_group' },
     });
-
-    expect(createdGroups).toEqual([
-      {
-        name: 'Gamma Team',
-        userOpenIds: ['ou_requester', 'ou_peer'],
-        chatId: 'fake_group_1',
-      },
-    ]);
-    expect(result.binding).toMatchObject({
+    expect(result.binding).toEqual({
       provider: 'builtin:feishu',
-      chat_id: 'fake_group_1',
-      chat_type: 'group',
-      team_id: 'gamma',
-      leader_name: 'gamma-leader',
+      chat_id: 'oc_existing_group',
     });
+    // The bound group resolves to the Team, and status/list surface it.
     await expect(
       teams.resolveChannel({
         dispatcherId: 'flow',
         provider: 'builtin:feishu',
-        chatId: 'p2p_control',
-        chatType: 'p2p',
-      }),
-    ).resolves.toBeNull();
-    await expect(
-      teams.resolveChannel({
-        dispatcherId: 'flow',
-        provider: 'builtin:feishu',
-        chatId: 'fake_group_1',
+        chatId: 'oc_existing_group',
         chatType: 'group',
       }),
     ).resolves.toMatchObject({ team_id: 'gamma' });
-    expect((await teams.ledger('flow', 'gamma')).events.map((event) => event.type))
-      .toEqual(['create', 'bind_channel', 'create_group']);
+    expect((await teams.status('flow', 'gamma')).binding).toEqual({
+      provider: 'builtin:feishu',
+      chat_id: 'oc_existing_group',
+    });
   });
 
-  it('dissolves the team when Feishu group creation fails', async () => {
-    const repo = await initGitRepo(join(root, 'failure-repo'));
-    const { teams, setCreateGroupError } = buildServices();
-    setCreateGroupError(new Error('missing Feishu chat permission'));
-
-    await expect(
-      teams.createGroup({
-        dispatcherId: 'flow',
-        name: 'delta',
-        repoCwd: repo,
-        leaderAgentRuntime: 'flow',
-        sourceChatId: 'p2p_control',
-        sourceChatType: 'p2p',
-        requesterOpenId: 'ou_requester',
-      }),
-    ).rejects.toThrow(/missing Feishu chat permission/);
-
-    const status = await teams.status('flow', 'delta');
-    expect(status.team.status).toBe('closed');
-    expect(
-      await teams.resolveChannel({
-        dispatcherId: 'flow',
-        provider: 'builtin:feishu',
-        chatId: 'fake_group_1',
-        chatType: 'group',
-      }),
-    ).toBeNull();
-  });
-
-  it('rejects create_group from a non-P2P source channel', async () => {
-    const repo = await initGitRepo(join(root, 'non-p2p-repo'));
+  it('history paginates by cursor and rejects an invalid cursor (#182 PR-7 P2)', async () => {
+    const repo = await initGitRepo(join(root, 'history-page-repo'));
     const { teams } = buildServices();
-    await expect(
-      teams.createGroup({
+    for (const name of ['t-one', 't-two', 't-three']) {
+      await teams.create({
         dispatcherId: 'flow',
-        name: 'epsilon',
+        name,
         repoCwd: repo,
         leaderAgentRuntime: 'flow',
-        sourceChatId: 'group_source',
-        sourceChatType: 'group',
-        requesterOpenId: 'ou_requester',
-      }),
-    ).rejects.toThrow(/P2P control channel/);
+        intent: 'work',
+      });
+    }
+
+    const page1 = await teams.history({ dispatcherId: 'flow', limit: 2 });
+    expect(page1.items).toHaveLength(2);
+    expect(page1.next_cursor).not.toBeNull();
+    const page2 = await teams.history({
+      dispatcherId: 'flow',
+      limit: 2,
+      cursor: page1.next_cursor!,
+    });
+    expect(page2.items).toHaveLength(1);
+    expect(page2.next_cursor).toBeNull();
+    // The two pages together cover all three Teams with no overlap.
+    const seen = [...page1.items, ...page2.items].map((row) => row.name).sort();
+    expect(seen).toEqual(['t-one', 't-three', 't-two']);
+    // An invalid cursor fails loud rather than silently resetting to page 0.
+    await expect(
+      teams.history({ dispatcherId: 'flow', cursor: 'not-a-cursor' }),
+    ).rejects.toThrow(/invalid history cursor/);
+  });
+
+  it('history is a filterable recovery search; list/status surface the bound group (#182 PR-7)', async () => {
+    const repo = await initGitRepo(join(root, 'history-repo'));
+    const { teams } = buildServices();
+
+    await teams.create({
+      dispatcherId: 'flow',
+      name: 'auth-team',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'ship the auth change',
+    });
+    await teams.create({
+      dispatcherId: 'flow',
+      name: 'billing-team',
+      repoCwd: repo,
+      leaderAgentRuntime: 'flow',
+      intent: 'fix billing',
+    });
+    await teams.dissolve({ dispatcherId: 'flow', teamId: 'billing-team', note: 'done' });
+
+    // No filters → both Teams, most-recent first (billing was touched last).
+    const all = await teams.history({ dispatcherId: 'flow' });
+    expect(all.items.map((row) => row.name).sort()).toEqual([
+      'auth-team',
+      'billing-team',
+    ]);
+    expect(all.next_cursor).toBeNull();
+
+    // close_status filter isolates the dissolved Team and carries recovery facts.
+    const closed = await teams.history({ dispatcherId: 'flow', closeStatus: 'closed' });
+    expect(closed.items.map((row) => row.name)).toEqual(['billing-team']);
+    expect(closed.items[0]).toMatchObject({
+      close_status: 'closed',
+      close_note: 'done',
+      close_note_preview: 'done',
+      source_repo: repo,
+    });
+
+    // grep matches intent text; status filter narrows to live Teams.
+    expect(
+      (await teams.history({ dispatcherId: 'flow', grep: 'auth' })).items.map((r) => r.name),
+    ).toEqual(['auth-team']);
+    expect(
+      (await teams.history({ dispatcherId: 'flow', status: 'running' })).items.map((r) => r.name),
+    ).toEqual(['auth-team']);
+
+    // Bind a group → it surfaces in list (bound_group) and status (binding).
+    await teams.bindChannel({
+      dispatcherId: 'flow',
+      teamId: 'auth-team',
+      provider: 'builtin:feishu',
+      chatId: 'chat-auth',
+      chatType: 'group',
+    });
+    const listed = await teams.list('flow');
+    const authRow = listed.find((row) => row.name === 'auth-team');
+    expect(authRow?.bound_group).toEqual({ provider: 'builtin:feishu', chat_id: 'chat-auth' });
+    const status = await teams.status('flow', 'auth-team');
+    expect(status.binding).toEqual({ provider: 'builtin:feishu', chat_id: 'chat-auth' });
   });
 });
 

@@ -63,8 +63,8 @@ information entry point for the 0.x fail-loud + rebuild policy (issue #98).
 `dreamux serve` is the foreground server entry point. The
 `daemon` group wraps the native user-level service manager (Linux
 `systemctl --user`, macOS `launchctl`); `daemon uninstall` removes only the
-service unit, whereas top-level `dreamux uninstall` removes config/state/logs
-too. `daemon restart --notify-resumed --dispatcher <id>` drops a one-shot
+service unit, whereas top-level `dreamux uninstall` removes
+config/run/cache/state/logs too. `daemon restart --notify-resumed --dispatcher <id>` drops a one-shot
 restart marker before restarting, so a resumed dispatcher gets a
 `Restart completed.` turn injected — see issue #78. Do not reintroduce
 global aliases such as `dreamux-server` or `server-ctl`; issue #18 explicitly
@@ -92,11 +92,35 @@ That record wins over older runtime-dir / SQLite decisions.
 - `~/.dreamux/config.json` — the only dreamux operator-editable config
   source. It holds dispatcher declarations and local Feishu credentials.
   `dreamux serve` must fail loudly when it is missing and tell the operator
-  to run `dreamux onboard`.
-- `~/.dreamux/state/` — server-owned state: `server.json`, `admin.sock`, and
-  per-dispatcher `status.json`, `access.json`, Codex socket files, and
-  `teammate/` task ledgers. Safe to remove when the operator intentionally
-  wants to discard server state.
+  to run `dreamux onboard`. Each dispatcher MUST declare an explicit `cwd`
+  (issue #182 PR-4): `dreamux serve` fails loud at startup if any enabled
+  dispatcher has no `cwd` — there is no fallback to a state directory. A
+  missing `cwd` directory is created (mkdir -p); an unusable one fails loud.
+  `dreamux doctor` diagnoses the same per-dispatcher contract.
+- `<dispatcher cwd>/.workspace/worktree/<repo-slug>/<slug>/` — Dreamux-managed
+  TeamMate/Team Git worktrees (issue #182 PR-4), relocated out of
+  `~/.dreamux/state/<id>/teammate/worktrees/`. They live in the dispatcher's
+  own workspace, never under `~/.dreamux`; `.workspace/` self-ignores (a `*`
+  .gitignore) so they never become repo content. `<repo-slug>` is
+  `<sanitized-basename>-<sha256(repo-root):12>`, disambiguating same-named repos
+  across Team/TeamMate usage. Managed worktree creation fails loud if the
+  workspace resolves under `~/.dreamux`. Legacy identity records pointing at the
+  old under-state path are read verbatim (no rewrite, no deletion).
+- `~/.dreamux/state/` — durable server-owned state: per-dispatcher
+  `status.json`, `access.json`, and `teammate/` task ledgers. Safe to remove
+  when the operator intentionally wants to discard server state.
+- `~/.dreamux/run/` — volatile run files (issue #182): `admin.sock` (+ lock),
+  `restart-intent.json`, and the `sockets/` fallback root for runtime
+  rendezvous sockets (preferred root is `$XDG_RUNTIME_DIR/dreamux/sockets/`).
+  Runtime socket paths are random per start, live only in process memory, and
+  are never persisted to durable state. Safe to clear while no server runs;
+  see `.agents/decisions/runtime-run-root.md`.
+- `~/.dreamux/cache/<dispatcher-id>/` — rebuildable cache (issue #182 PR-2):
+  `spill/` for over-budget teammate completion results (only the path is
+  inlined into a dispatcher turn) and `feishu-attachments/` for inbound
+  attachment downloads. Not durable state; safe to delete while no server runs.
+  Completion spill was relocated out of shared `/tmp`, attachments out of
+  `state/<dispatcher-id>/`.
 - `~/.dreamux/logs/` — server-owned logs, split by component; Codex
   app-server logs use `~/.dreamux/logs/codex-app-server/<dispatcher>.log`, and
   MCP shim diagnostics use component directories such as `feishu-mcp/` and
@@ -143,8 +167,10 @@ explicitly supersedes the top-level design.
   work from any cwd and via `~/bin/<x>` shortcuts. The POSIX symlink-walk
   loop in `/packages/dreamux/bin/dreamux` is the reference shape; reuse it
   verbatim for any new launcher.
-- **Neutral path builders go in `src/platform/paths.ts` only; per-runtime path
-  derivation lives in each builtin's `src/agent-runtime/builtin/<name>/paths.ts`.**
+- **Neutral path builders go in `src/platform/paths.ts` only (volatile
+  runtime-socket allocation in `src/platform/runtime-sockets.ts`); per-runtime
+  path derivation lives in each builtin's
+  `src/agent-runtime/builtin/<name>/paths.ts`.**
   Cross-process file contracts (the admin socket path, dispatcher state files,
   logs) drift silently if any other file constructs them by raw string
   concatenation.

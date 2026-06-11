@@ -60,6 +60,8 @@ export class TeamStore {
       closedAt?: number | null;
       closeNote?: string | null;
       worktree?: TeamRecord['worktree'];
+      intent?: string;
+      leaderName?: string;
     },
   ): Promise<TeamRecord> {
     const updated: TeamRecord = {
@@ -68,6 +70,12 @@ export class TeamStore {
       ...(input.closedAt !== undefined ? { closed_at: input.closedAt } : {}),
       ...(input.closeNote !== undefined ? { close_note: input.closeNote } : {}),
       ...(input.worktree !== undefined ? { worktree: input.worktree } : {}),
+      // Recreating a closed Team allocates a FRESH concrete leader name (#188:
+      // concrete names are never reused), so the reused record adopts it.
+      ...(input.leaderName !== undefined ? { leader_name: input.leaderName } : {}),
+      // Recreating a closed Team must refresh the recovery subject so the reused
+      // record carries the new create.intent, not a stale one (issue #182 PR-3).
+      ...(input.intent !== undefined ? { intent: input.intent } : {}),
       updated_at: Date.now(),
     };
     await this.write(updated);

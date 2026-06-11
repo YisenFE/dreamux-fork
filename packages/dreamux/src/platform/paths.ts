@@ -1,27 +1,34 @@
 /**
- * Filesystem layout for dreamux-owned runtime state and logs.
+ * Filesystem layout for dreamux-owned runtime state, volatile run files, and
+ * logs.
  *
- * Effective MVP layout:
+ * Effective layout (issue #182 PR-1 split durable state from volatile run
+ * files):
  *   ~/.dreamux/
- *     state/
- *       server.json
- *       admin.sock
+ *     run/                    volatile IPC/control artifacts; safe to clear
+ *                             when no dreamux server is running
+ *       admin.sock            admin control socket (+ admin.sock.lock)
+ *       restart-intent.json   one-shot daemon restart marker
+ *       sockets/              fallback root for runtime rendezvous sockets
+ *                             (see platform/runtime-sockets.ts)
+ *     state/                  durable server-owned state
  *       <dispatcher-id>/
  *         status.json
  *         access.json
- *         codex.sock          Codex app-server Unix socket
  *         teammate/           Server-hosted TeamMate identities and history
  *     logs/
  *       dreamux-server.log
  *       codex-app-server/
  *         <dispatcher-id>.log
  *
- * `stateRoot()` is the single root for dreamux-owned state. The old
+ * `stateRoot()` is the single root for dreamux-owned durable state; `runRoot()`
+ * is the single root for dreamux-owned volatile run files. The old
  * `runtime_dir` concept (and its `runtimeRoot()` alias) was retired in issue #98.
  */
 
+import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -66,33 +73,123 @@ export function dreamuxRoot(): string {
   return join(homedir(), '.dreamux');
 }
 
+/** Lexical containment: is `candidate` at or under `root` (both resolved)? */
+function pathIsAtOrUnder(root: string, candidate: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate));
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+}
+
+/**
+ * True when `path` resolves to, or inside, the dreamux home root
+ * (`~/.dreamux`). Lexical only — a path that *symlinks* into `~/.dreamux` is not
+ * caught here; use {@link isRealPathUnderDreamuxRoot} for the placement guard.
+ * Managed worktree creation must fail loud rather than place a worktree under
+ * Dreamux's own state/run/cache tree (issue #182 PR-4): a dispatcher workspace
+ * must be a real operator project directory, never the retired state-dir
+ * fallback or any other path inside `~/.dreamux`.
+ */
+export function isUnderDreamuxRoot(path: string): boolean {
+  return pathIsAtOrUnder(dreamuxRoot(), path);
+}
+
+/** realpath, falling back to a lexical resolve when the path does not exist. */
+async function canonicalPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Symlink-safe variant of {@link isUnderDreamuxRoot} (issue #182 PR-4, PR #186
+ * review P1): canonicalizes BOTH the dreamux root and `path` with `realpath`
+ * before the containment check, so a workspace path that lives outside
+ * `~/.dreamux` lexically but symlinks into it is still rejected. This is the
+ * authoritative guard for managed-worktree placement, where a bypass would put
+ * worktrees physically under Dreamux home.
+ */
+export async function isRealPathUnderDreamuxRoot(path: string): Promise<boolean> {
+  const [realRoot, realPath] = await Promise.all([
+    canonicalPath(dreamuxRoot()),
+    canonicalPath(path),
+  ]);
+  return pathIsAtOrUnder(realRoot, realPath);
+}
+
 export function stateRoot(): string {
   return join(dreamuxRoot(), 'state');
 }
 
-export function serverJsonPath(): string {
-  return join(stateRoot(), 'server.json');
+/**
+ * Root for dreamux-owned volatile run files: IPC sockets, lock files, and
+ * one-shot control markers. Nothing under it is durable; it is safe to remove
+ * while no dreamux server is running. Durable state stays under `stateRoot()`.
+ */
+export function runRoot(): string {
+  return join(dreamuxRoot(), 'run');
 }
 
 /**
  * One-shot marker dropped by `dreamux daemon restart --notify-resumed` before
  * it triggers the service-manager restart. The freshly started server reads it
  * once, deletes it, and injects a "restart completed" notice into the named
- * resumed dispatchers. Server-owned state; safe to delete.
+ * resumed dispatchers. Volatile run file; safe to delete.
  */
 export function restartIntentPath(): string {
-  return join(stateRoot(), 'restart-intent.json');
+  return join(runRoot(), 'restart-intent.json');
 }
 
 export function logsRoot(): string {
   return join(dreamuxRoot(), 'logs');
 }
 
+/**
+ * Root for dreamux-owned cache: rebuildable, droppable artifacts that are
+ * neither durable state nor volatile run files (issue #182 PR-2). Holds
+ * per-dispatcher completion spill files and inbound attachment caches. Safe to
+ * remove while no server is running; nothing here is part of identity, status,
+ * history, or checkpoint recovery.
+ */
+export function cacheRoot(): string {
+  return join(dreamuxRoot(), 'cache');
+}
+
+export function dispatcherCacheDir(id: string): string {
+  return join(cacheRoot(), dispatcherPathSegment(id));
+}
+
+/**
+ * Per-dispatcher completion-spill directory (issue #182 PR-2): where an
+ * over-budget teammate completion result is written so only its path is inlined
+ * into the dispatcher turn. Cache, not state — the file is read by no process;
+ * it is surfaced to the dispatcher model as text and is safe to delete.
+ */
+export function dispatcherCompletionSpillDir(id: string): string {
+  return join(dispatcherCacheDir(id), 'spill');
+}
+
+/**
+ * The stable cross-process admin IPC endpoint. Packaged CLI commands and MCP
+ * shims resolve it through this builder only — it is a fixed path contract, so
+ * an over-budget path (extreme $HOME length) fails loudly instead of moving.
+ */
 export function adminSocketPath(): string {
   return assertUnixSocketPathBudget(
-    join(stateRoot(), 'admin.sock'),
+    join(runRoot(), 'admin.sock'),
     'admin socket path',
   );
+}
+
+/**
+ * The pre-#182 admin socket location, under durable state. PR-1 moved the live
+ * admin socket to `run/admin.sock`; this builder exists only so a new server
+ * can detect a still-running OLD-version server (which locks the legacy path)
+ * and fail loud — see `assertNoLegacyAdminServer`. Detection only: dreamux
+ * never removes or migrates the legacy file.
+ */
+export function legacyAdminSocketPath(): string {
+  return join(stateRoot(), 'admin.sock');
 }
 
 export function dispatcherDir(id: string): string {
@@ -187,16 +284,18 @@ export function dispatcherTeamMateIdentityPath(
   );
 }
 
-/** Forward-only JSONL history for one TeamMate identity. */
-export function dispatcherTeamMateHistoryPath(
-  id: string,
-  teammateName: string,
-): string {
-  return join(
-    dispatcherTeamMateDir(id),
-    'history',
-    `${teamMateNameSegment(teammateName)}.jsonl`,
-  );
+/**
+ * Per-dispatcher append-only TeamMate/Team session ledger (issue #182 PR-5).
+ * One file per dispatcher — NOT one file per transient runtime session — so the
+ * file count stays bounded as teammates come and go. Each line is a lifecycle
+ * event (spawn / send / settled / close) keyed by a stable `session_id`; a
+ * future read surface (PR-6) materializes session rows by folding the events.
+ * Durable: it preserves the facts needed to reconstruct work weeks later (repo,
+ * cwd, branch/worktree, name/team id, runtime checkpoint/session id, intent,
+ * close note) and never records a volatile runtime socket path.
+ */
+export function dispatcherTeamMateSessionLedgerPath(id: string): string {
+  return join(dispatcherTeamMateDir(id), 'sessions.jsonl');
 }
 
 export function dispatcherTeamMateRuntimeDir(
@@ -204,16 +303,6 @@ export function dispatcherTeamMateRuntimeDir(
   teammateName: string,
 ): string {
   return join(dispatcherTeamMateDir(id), 'runtime', teamMateNameSegment(teammateName));
-}
-
-/** Dreamux-managed Git worktrees for one dispatcher. */
-export function dispatcherTeamMateWorktreesDir(id: string): string {
-  return join(dispatcherTeamMateDir(id), 'worktrees');
-}
-
-/** One Dreamux-managed Git worktree path for a teammate slug. */
-export function dispatcherTeamMateWorktreePath(id: string, slug: string): string {
-  return join(dispatcherTeamMateWorktreesDir(id), teamMateNameSegment(slug));
 }
 
 /** Per-dispatcher Team Mode state root. */
@@ -252,14 +341,23 @@ export function teamMateNameSegment(name: string): string {
  * never floods the dispatcher's context. Neutral: a completion is a
  * runtime-agnostic concept, so no runtime specifics appear here.
  *
- * Lives under the OS temp dir (the spec's `/tmp/teammate-{source}-{id}.output`
- * template); `source` and `id` are sanitized for filename safety. The id is
- * unique per completion (teammate name + turn id), so the only realistic
- * collision is two dispatchers producing the same teammate/turn id — acceptable
- * for a short-lived 0600 spill file.
+ * Lives under the dispatcher's cache spill dir (issue #182 PR-2 moved it out of
+ * shared `/tmp`, which is not a good long-term contract for a path surfaced in
+ * dispatcher-visible text). `spillDir` is the owning dispatcher's
+ * `dispatcherCompletionSpillDir`, supplied by the runtime's path context so a
+ * teammate runtime spills under its operator dispatcher, not its composite
+ * runtime id. `source` and `id` are sanitized for filename safety; the id is
+ * unique per completion (teammate name + turn id).
  */
-export function teamMateCompletionOutputPath(source: string, id: string): string {
-  return `/tmp/teammate-${teamMateNameSegment(source)}-${teamMateNameSegment(id)}.output`;
+export function teamMateCompletionOutputPath(
+  spillDir: string,
+  source: string,
+  id: string,
+): string {
+  return join(
+    spillDir,
+    `teammate-${teamMateNameSegment(source)}-${teamMateNameSegment(id)}.output`,
+  );
 }
 
 /**
@@ -272,9 +370,13 @@ export function dispatcherChatBotsPath(id: string): string {
   return join(dispatcherDir(id), 'chat-bots.json');
 }
 
-/** Per-dispatcher Feishu inbound attachment cache, owned by the server. */
+/**
+ * Per-dispatcher Feishu inbound attachment cache, owned by the server. Cache,
+ * not durable state (issue #182 PR-2 moved it out of `state/<id>/` into
+ * `cache/<id>/`): inbound attachments are re-fetchable and safe to delete.
+ */
 export function dispatcherFeishuAttachmentCacheDir(id: string): string {
-  return join(dispatcherDir(id), 'feishu-attachments');
+  return join(dispatcherCacheDir(id), 'feishu-attachments');
 }
 
 export function unixSocketPathFitsBudget(path: string): boolean {

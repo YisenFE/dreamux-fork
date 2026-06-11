@@ -20,10 +20,11 @@
  *     start`) does not claim a stale notice.
  */
 
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { restartIntentPath } from '../platform/paths.js';
+import { ensureOwnerOnlyDir } from '../platform/owner-only-dir.js';
 
 /** Default English notice injected into a resumed dispatcher after restart. */
 export const DEFAULT_RESTART_ANNOUNCE = 'Restart completed.';
@@ -72,7 +73,11 @@ export async function writeRestartIntent(
         : DEFAULT_RESTART_ANNOUNCE,
     targets: dedupeNonEmpty(options.targets),
   };
-  await mkdir(dirname(path), { recursive: true });
+  // The CLI may be the first process to create the volatile run root (the
+  // upgrade sequence writes this marker before the new server ever starts), so
+  // own it owner-only here too — and tighten a pre-existing permissive run dir
+  // rather than trusting it (issue #182 run-root invariant).
+  await ensureOwnerOnlyDir(dirname(path));
   await writeFile(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
   return path;
 }

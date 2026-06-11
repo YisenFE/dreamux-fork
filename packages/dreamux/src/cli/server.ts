@@ -29,10 +29,12 @@ import {
   feishuChannelLogDir,
   feishuChannelLogPath,
   feishuMcpLogDir,
+  legacyAdminSocketPath,
   logsRoot,
   serverLogPath,
   stateRoot,
 } from '../platform/paths.js';
+import { sweepRuntimeSocketDirs } from '../platform/runtime-sockets.js';
 
 async function main(): Promise<void> {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
@@ -75,6 +77,8 @@ async function main(): Promise<void> {
     logger,
     channelLoggerFactory: (id) =>
       createLogger({ name: `channel/${id}`, filePath: feishuChannelLogPath(id) }),
+    runtimeSocketSweep: () => sweepRuntimeSocketDirs(),
+    legacyAdminLockPath: `${legacyAdminSocketPath()}.lock`,
   });
   await server.start();
   logger.info({ admin_socket: adminSocketPath() }, 'server up');
@@ -102,9 +106,11 @@ Global config:
                             Feishu channel secrets.
 
 Runtime data:
-  ~/.dreamux/state/         server state, admin socket,
-                            per-dispatcher runtime sockets/config, and
-                            TeamMate ledgers.
+  ~/.dreamux/run/           volatile run files: admin socket + lock, one-shot
+                            restart marker, and runtime rendezvous sockets.
+                            Safe to clear while no server is running.
+  ~/.dreamux/state/         durable server state: per-dispatcher status/access
+                            files and TeamMate ledgers.
   ~/.dreamux/logs/          server, Feishu channel, Codex app-server, and MCP
                             shim logs.
 

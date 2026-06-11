@@ -14,6 +14,8 @@ import { runUninstall } from '../src/onboard/uninstall.js';
 import type { CommandRunner } from '../src/onboard/types.js';
 import {
   logsRoot,
+  cacheRoot,
+  runRoot,
   resetRuntimeConfig,
   stateRoot,
 } from '../src/platform/paths.js';
@@ -64,6 +66,8 @@ describe('dreamux uninstall', () => {
     const workspaceSkillDirs = dispatcherWorkspaceSkillDirs(dispatcherCwd);
     mkdirSync(configDir, { recursive: true });
     mkdirSync(stateRoot(), { recursive: true });
+    mkdirSync(join(runRoot(), 'sockets'), { recursive: true });
+    mkdirSync(join(cacheRoot(), 'flow', 'spill'), { recursive: true });
     mkdirSync(logsRoot(), { recursive: true });
     mkdirSync(dirname(servicePath), { recursive: true });
     for (const skillDir of workspaceSkillDirs) {
@@ -102,6 +106,8 @@ describe('dreamux uninstall', () => {
 
     expect(existsSync(configDir)).toBe(false);
     expect(existsSync(stateRoot())).toBe(false);
+    expect(existsSync(runRoot())).toBe(false);
+    expect(existsSync(cacheRoot())).toBe(false);
     expect(existsSync(logsRoot())).toBe(false);
     expect(existsSync(servicePath)).toBe(false);
     for (const skillDir of workspaceSkillDirs) {
@@ -112,6 +118,8 @@ describe('dreamux uninstall', () => {
         { status: 'removed', path: configDir, reason: 'dreamux config directory' },
         { status: 'removed', path: servicePath, reason: 'systemd unit' },
         { status: 'removed', path: stateRoot(), reason: 'dreamux state directory' },
+        { status: 'removed', path: runRoot(), reason: 'dreamux run directory' },
+        { status: 'removed', path: cacheRoot(), reason: 'dreamux cache directory' },
         { status: 'removed', path: logsRoot(), reason: 'dreamux logs directory' },
         ...workspaceSkillDirs.map((skillDir) => ({
           status: 'skipped' as const,
