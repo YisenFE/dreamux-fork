@@ -5,26 +5,52 @@ ships in the npm package:
 
 - `dispatcher` teaches dispatcher app-server sessions how to delegate product
   work to TeamMates. The default interface is the server-hosted TeamMate MCP:
-  `spawn` creates a semi-resident TeamMate and returns its concrete, never-reused
-  name (issue #188 — the requested `name` is only a base slug / `display_name`;
-  all later calls use the returned name), `send` submits follow-up turns (and
-  reopens a closed TeamMate from its persisted checkpoint — there is no
-  standalone dispatcher-facing `resume` verb; #155), and `close` stops one.
-  `history` is the durable session-ledger search surface, `last` reads a
-  TeamMate's most recent settled turn(s) (`turns` 1..5) from that ledger by
-  concrete name — working even for a closed TeamMate without starting a runtime —
-  and `list`/`status`/`get_capabilities` read state without polling. The obsolete
-  `ctx` and `history_events` verbs were removed (issue #188). The `tm` CLI is the
-  explicit fallback for legacy diagnostics
+  `spawn` creates a semi-resident TeamMate from a requested `name_prefix` and
+  returns its concrete, never-reused `name` (issue #199 Slice 1 — `name_prefix`
+  is only the requested label; all later calls use the returned `name`), `send`
+  submits follow-up turns (and reopens a closed TeamMate when one is not live —
+  there is no standalone dispatcher-facing `resume` verb; #155), and `close`
+  stops one. `history` is a compact recovery search keyed by concrete name
+  (filter by `name` / `status` / `agent_runtime` / `repo` / `grep` / `since` /
+  `until`, paginate with `limit` / `cursor`; returns `{ items, next_cursor }`)
+  — a recovery list, not a raw event timeline; `last` reads a TeamMate's most
+  recent settled turn(s) (`turns` 1..5) by concrete name — working even for a
+  closed TeamMate without starting a runtime — and
+  `list`/`status`/`get_capabilities` read state without polling. The lifecycle
+  `status` filter is kept; the public `history` surface no longer exposes the
+  retired `state` / `close_status` filters, the Dreamux-made `session_id`,
+  `id`/`team_id`, `display_name`, the machine-local cwd/worktree paths, or
+  runtime `checkpoint` (issue #199 Slice 1). Issue #199 Slice 2 collapses the
+  shared spawn/send/status/list output (`TeamMateRuntimeStatus`): `owner` is the
+  sole ownership authority (no public `role`/`team_id`), `display_name` and the
+  runtime `checkpoint` are gone, `session_id` now means the runtime-native thread
+  id (early `null` acceptable), and the cwd/source/worktree family is reported
+  through one compact `repo` view. The public work-directory INPUT for
+  `spawn`/`team.create` is the matching optional `repo` object (`{ mode: reuse-cwd
+  | managed, path?, base_ref?, branch?, slug?, cleanup? }`; omitted → a plain
+  per-name work dir under the dispatcher workspace,
+  `<dispatcher cwd>/.workspace/work/<name>/`, created with `mkdir -p` and NOT a
+  git worktree, so the dispatcher cwd need not be a git repo — `reuse-cwd` runs
+  in `path`, `managed` creates a git worktree; issue #199), replacing the old
+  `cwd` / `repo_cwd` / `worktree` inputs. The obsolete `ctx` and
+  `history_events` verbs were removed (issue #188). The
+  `tm` CLI is the explicit fallback for legacy diagnostics
   ([provider architecture realignment](../decisions/provider-architecture-realignment.md)).
 - `team-dev-workflow` covers multi-teammate review, design, merge, and unblock
   coordination.
 - `team` MCP is injected for dispatcher-only Team Mode lifecycle, addressed by
-  Team name (issue #182 PR-7/PR-8): `create` a TeamLeader (optionally binding an
-  EXISTING Feishu group via `bind_group: { chat_id }`), inspect with `list`
-  (compact rows) / `status` (one Team's detail incl. active bound group) /
-  `history` (filterable recovery search), `bind_group` an existing group or
-  `transfer_channel_back`, and `dissolve` a Team. The `create_group`
+  `team_name` (issue #182 PR-7/PR-8; concrete-key rename in #199 Slice 1):
+  `create` a TeamLeader (with an optional `repo` object, same shape as
+  `teammate.spawn`, replacing the old `repo_cwd`; #199 Slice 2) — optionally
+  binding an EXISTING Feishu group via `bind_group: { chat_id }` — inspect with
+  `list` (compact rows) / `status` (the public `team_name`-keyed team view +
+  leader/binding summary, no machine-local `repo_cwd`/`worktree`; #199 Slice 2) /
+  `history` (a compact recovery search
+  by `team_name` / `status` / `repo` / `grep` / `since` / `until`, returning
+  `{ items, next_cursor }`; the retired `close_status` filter and the
+  `team_id` / machine-local cwd/worktree rows are gone in #199 Slice 1),
+  `bind_group` an existing group or `transfer_channel_back`, and `dissolve` a
+  Team. The `create_group`
   (create-a-new-group) and raw `ledger` verbs were retired. TeamLeader member
   work still uses the caller-scoped TeamMate MCP.
 - `dreamux-maintenance` covers installed Dreamux diagnosis and safe operation.
@@ -57,10 +83,16 @@ supersedes the older dispatcher/tm boundary for server-owned TeamMate state.
 Two state owners are kept distinct in the skill:
 
 - The Dreamux server owns TeamMate **agent state** behind the injected
-  dispatcher-scoped `teammate` MCP — concrete identities (with their requested
-  `display_name`), runtime checkpoints, statuses, and the durable session ledger
-  (prompts plus the captured final assistant output that `last` returns) under
-  `~/.dreamux/state/<dispatcher-id>/teammate/`.
+  dispatcher-scoped `teammate` MCP — per-name records
+  (`teammate/records/<name>.json`: identity + rolling recovery summary, the
+  source for history/list/status) and a per-name turns archive
+  (`teammate/turns/<name>.jsonl`, the only JSONL store: prompts plus the captured
+  final assistant output that `last` returns) under
+  `~/.dreamux/state/<dispatcher-id>/teammate/` (issue #199 Slice 3). The former
+  `sessions.jsonl` session ledger and the persisted checkpoint object are gone;
+  `session_id` is the runtime-native thread id. The persisted record still keeps
+  the requested label internally; the `history` projection no longer surfaces it
+  (issue #199 Slice 1).
 - The Dreamux server owns Team **lifecycle state** behind the injected
   dispatcher-scoped `team` MCP under `~/.dreamux/state/<dispatcher-id>/team/`.
   TeamLeader and member agents remain TeamMate identities with role/owner

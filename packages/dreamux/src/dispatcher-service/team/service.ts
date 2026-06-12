@@ -3,9 +3,8 @@ import { Buffer } from 'node:buffer';
 import { WorktreeManager } from '../teammate/worktree-manager.js';
 import type { TeamMateAgentService, TeamMateSharedWorkspace } from '../teammate/service.js';
 import {
-  dispatcherPrincipal,
   requireLifecycleText,
-  teamLeaderPrincipal,
+  teamServicePrincipal,
 } from '../teammate/types.js';
 import { ChannelBindingStore } from '../channel-binding/store.js';
 import type { ChannelBinding } from '../channel-binding/store.js';
@@ -19,14 +18,17 @@ import type {
   TeamHistoryQuery,
   TeamHistoryResult,
   TeamHistoryRow,
-  TeamLedgerResult,
   TeamListRow,
   TeamRecord,
   TeamSummary,
   TeamTransferChannelBackInput,
+  TeamView,
 } from './types.js';
 import { validateTeamId } from './types.js';
-import type { TeamMateIdentityStatus } from '../teammate/types.js';
+import type {
+  TeamMateIdentityStatus,
+  TeamMateRuntimeStatus,
+} from '../teammate/types.js';
 
 export interface TeamServiceOptions {
   teammates: TeamMateAgentService;
@@ -48,19 +50,33 @@ export class TeamService {
     if (existing !== null && existing.status !== 'closed') {
       throw new Error(`Team ${JSON.stringify(teamId)} already exists`);
     }
-    const workspace = await this.worktrees.prepare({
-      dispatcherId: input.dispatcherId,
-      teammateName: `team-${teamId}`,
-      cwd: input.repoCwd,
-      dispatcherWorkspace: await this.opts.teammates.dispatcherWorkspace(
-        input.dispatcherId,
-      ),
-      request: input.worktree ?? {
-        mode: 'managed',
-        slug: `team-${teamId}`,
-        cleanup: 'keep',
-      },
-    });
+    const dispatcherWorkspace = await this.opts.teammates.dispatcherWorkspace(
+      input.dispatcherId,
+    );
+    // #199: no `repo` (no explicit cwd, no worktree request) → a plain
+    // `<dispatcher cwd>/.workspace/work/<team_name>/` directory shared by the
+    // TeamLeader and every member, NOT a git worktree, so the dispatcher cwd
+    // need not be a git repo. An explicit `repo` keeps the prior semantics:
+    // reuse-cwd runs in the given cwd; managed (also the in-process default when
+    // a repoCwd is supplied) creates a git worktree under the dispatcher
+    // workspace.
+    const workspace =
+      input.worktree === undefined && input.repoCwd === undefined
+        ? await this.worktrees.prepareDefaultWorkspace({
+            dispatcherWorkspace,
+            slug: teamId,
+          })
+        : await this.worktrees.prepare({
+            dispatcherId: input.dispatcherId,
+            teammateName: `team-${teamId}`,
+            cwd: input.repoCwd ?? dispatcherWorkspace,
+            dispatcherWorkspace,
+            request: input.worktree ?? {
+              mode: 'managed',
+              slug: `team-${teamId}`,
+              cleanup: 'keep',
+            },
+          });
     // The TeamLeader address is a concrete, never-reused name (issue #188), not
     // a reconstructed `${teamId}-leader`. ALWAYS allocate a fresh one — including
     // when recreating a closed Team: `createTeamLeader` mints a new session and
@@ -73,7 +89,6 @@ export class TeamService {
       input.dispatcherId,
       teamId,
     );
-    const leaderDisplayName = `${teamId}-leader`;
     let team =
       existing ??
       (await this.store.create({
@@ -108,7 +123,6 @@ export class TeamService {
       dispatcherId: input.dispatcherId,
       teamId,
       name: leaderName,
-      displayName: leaderDisplayName,
       prompt,
       agentRuntime: input.leaderAgentRuntime,
       sourceCwd: workspace.sourceCwd,
@@ -118,10 +132,6 @@ export class TeamService {
       intent: input.intent,
     });
     team = await this.store.update(team, { status: 'running' });
-    await this.store.appendLedger(team, {
-      type: 'create',
-      summary: `created team ${teamId} with leader ${leaderName}`,
-    });
     // Optionally bind an existing Feishu group at create time (issue #182 PR-8,
     // the settled replacement for the retired create_group flow). Bind is the
     // last step; if it fails the Team is already persisted, so roll back by
@@ -149,7 +159,7 @@ export class TeamService {
       }
     }
     return {
-      team,
+      team: teamView(team),
       leader: leader.teammate,
       member_count: await this.memberCount(team),
       binding,
@@ -171,9 +181,10 @@ export class TeamService {
 
   /**
    * Filterable Team recovery search (issue #182 PR-7) — the Team-side mirror of
-   * the TeamMate `history` surface. Finds Teams (closed included) by
-   * name/status/repo/intent/time, sorted most-recent first, with a cursor. The
-   * raw per-team lifecycle event timeline stays internal (`ledger`), not here.
+   * the TeamMate `history` surface. Reads the compact recovery rows straight
+   * from the `team/records/<team_name>.json` JSON records (closed included),
+   * sorted most-recent first, with a cursor. There is no team event/audit
+   * archive to fold (issue #199 Slice 3 removed it).
    */
   async history(input: TeamHistoryQuery): Promise<TeamHistoryResult> {
     const teams = await this.store.list(input.dispatcherId);
@@ -186,7 +197,7 @@ export class TeamService {
       (a, b) =>
         b.updated_at - a.updated_at ||
         b.created_at - a.created_at ||
-        a.name.localeCompare(b.name),
+        a.team_name.localeCompare(b.team_name),
     );
     const start = input.cursor !== undefined ? decodeTeamCursor(input.cursor) : 0;
     const limit = clampTeamHistoryLimit(input.limit);
@@ -198,21 +209,13 @@ export class TeamService {
     };
   }
 
-  async ledger(dispatcherId: string, teamId: string): Promise<TeamLedgerResult> {
-    const team = await this.store.get(dispatcherId, validateTeamId(teamId));
-    return {
-      team,
-      events: await this.store.ledger(dispatcherId, teamId),
-    };
-  }
-
   async dissolve(input: TeamDissolveInput): Promise<TeamSummary> {
     // Required dissolve reason — enforced for in-process callers too (issue
-    // #182 PR-3); it also feeds the member/leader closes and the ledger.
+    // #182 PR-3); it also feeds the member/leader closes.
     requireLifecycleText(input.note, 'Team dissolve note');
     const team = await this.mustTeam(input.dispatcherId, input.teamId);
     for (const binding of await this.bindings.list(input.dispatcherId)) {
-      if (binding.active && binding.team_id === team.team_id) {
+      if (binding.active && binding.team_name === team.team_id) {
         await this.bindings.transferBack({
           dispatcherId: input.dispatcherId,
           provider: binding.provider,
@@ -221,30 +224,20 @@ export class TeamService {
         });
       }
     }
-    const members = await this.opts.teammates.listScoped(
-      teamLeaderPrincipal({
-        dispatcherId: input.dispatcherId,
-        teamId: team.team_id,
-        leaderName: team.leader_name,
-      }),
-    );
+    const principal = this.teamPrincipal(team);
+    const members = await this.members(team);
     // dissolve note is required (issue #182 PR-3), so the member/leader close
-    // calls and the ledger carry the operator's real reason — no synthetic
-    // 'team dissolved' fallback. Internal/system dissolves pass an explicit
-    // system-authored note instead.
+    // calls carry the operator's real reason — no synthetic 'team dissolved'
+    // fallback. Internal/system dissolves pass an explicit system-authored note.
     for (const member of members) {
       await this.opts.teammates.closeScoped({
-        principal: teamLeaderPrincipal({
-          dispatcherId: input.dispatcherId,
-          teamId: team.team_id,
-          leaderName: team.leader_name,
-        }),
+        principal,
         name: member.name,
         note: input.note,
       });
     }
-    await this.opts.teammates.close({
-      dispatcherId: input.dispatcherId,
+    await this.opts.teammates.closeScoped({
+      principal,
       name: team.leader_name,
       note: input.note,
     });
@@ -257,10 +250,6 @@ export class TeamService {
         source_repo: team.source_repo,
         worktree: team.worktree,
       }),
-    });
-    await this.store.appendLedger(closed, {
-      type: 'dissolve',
-      summary: input.note,
     });
     return this.summary(closed);
   }
@@ -275,12 +264,8 @@ export class TeamService {
       provider: input.provider,
       chatId: input.chatId,
       chatType: input.chatType,
-      teamId: team.team_id,
+      teamName: team.team_id,
       leaderName: team.leader_name,
-    });
-    await this.store.appendLedger(team, {
-      type: 'bind_channel',
-      summary: `bound ${input.provider} ${input.chatType} ${input.chatId}`,
     });
     return binding;
   }
@@ -288,17 +273,7 @@ export class TeamService {
   async transferChannelBack(
     input: TeamTransferChannelBackInput,
   ): Promise<ChannelBinding | null> {
-    const binding = await this.bindings.transferBack(input);
-    if (binding !== null) {
-      const team = await this.store.get(input.dispatcherId, binding.team_id);
-      if (team !== null) {
-        await this.store.appendLedger(team, {
-          type: 'transfer_channel_back',
-          summary: `transferred ${input.provider} ${input.chatType} ${input.chatId} back to dispatcher`,
-        });
-      }
-    }
-    return binding;
+    return this.bindings.transferBack(input);
   }
 
   async resolveChannel(input: {
@@ -309,7 +284,7 @@ export class TeamService {
   }): Promise<ChannelBinding | null> {
     const binding = await this.bindings.resolve(input);
     if (binding === null) return null;
-    const team = await this.store.get(input.dispatcherId, binding.team_id);
+    const team = await this.store.get(input.dispatcherId, binding.team_name);
     if (team === null || team.status === 'closed') return null;
     return binding;
   }
@@ -329,7 +304,7 @@ export class TeamService {
     });
     return (
       binding !== null &&
-      binding.team_id === input.teamId &&
+      binding.team_name === input.teamId &&
       binding.leader_name === input.leaderName
     );
   }
@@ -342,24 +317,10 @@ export class TeamService {
     const team = await this.mustTeam(input.dispatcherId, input.teamId);
     if (team.status === 'closed') return { status: 'stopped' };
     return this.opts.teammates.channelInputScoped(
-      dispatcherPrincipal(input.dispatcherId),
+      this.teamPrincipal(team),
       team.leader_name,
       input.turn,
     );
-  }
-
-  async recordLeaderTurn(input: {
-    dispatcherId: string;
-    leaderName: string;
-    summary: string;
-  }): Promise<void> {
-    const teams = await this.store.list(input.dispatcherId);
-    const team = teams.find((item) => item.leader_name === input.leaderName);
-    if (team === undefined || team.status === 'closed') return;
-    await this.store.appendLedger(team, {
-      type: 'leader_turn',
-      summary: input.summary,
-    });
   }
 
   async sharedWorkspace(
@@ -376,14 +337,13 @@ export class TeamService {
   }
 
   private async summary(team: TeamRecord): Promise<TeamSummary> {
-    let leader = null;
-    try {
-      leader = await this.opts.teammates.status(team.dispatcher_id, team.leader_name);
-    } catch {
-      leader = null;
-    }
+    // #199 Slice 4: the leader is read with the internal Team-service authority —
+    // a TeamLeader is not visible on the dispatcher `teammate.*` surface.
+    const leader = await this.opts.teammates
+      .statusScoped(this.teamPrincipal(team), team.leader_name)
+      .catch(() => null);
     return {
-      team,
+      team: teamView(team),
       leader,
       member_count: await this.memberCount(team),
       binding: await this.activeGroupBinding(team),
@@ -392,13 +352,10 @@ export class TeamService {
 
   private async listRow(team: TeamRecord): Promise<TeamListRow> {
     return {
-      name: team.team_id,
-      team_id: team.team_id,
+      team_name: team.team_id,
       status: team.status,
       intent: team.intent,
       source_repo: team.source_repo,
-      repo_cwd: team.repo_cwd,
-      worktree_mode: team.worktree.mode,
       leader_name: team.leader_name,
       leader_state: await this.leaderState(team),
       member_count: await this.memberCount(team),
@@ -411,15 +368,10 @@ export class TeamService {
 
   private async historyRow(team: TeamRecord): Promise<TeamHistoryRow> {
     return {
-      name: team.team_id,
-      team_id: team.team_id,
+      team_name: team.team_id,
       status: team.status,
-      close_status: team.closed_at === null ? 'open' : 'closed',
       intent: team.intent,
       source_repo: team.source_repo,
-      repo_cwd: team.repo_cwd,
-      runtime_cwd: team.runtime_cwd,
-      worktree: team.worktree,
       leader_name: team.leader_name,
       leader_agent_runtime: team.leader_agent_runtime,
       leader_state: await this.leaderState(team),
@@ -438,12 +390,19 @@ export class TeamService {
   private async leaderState(
     team: TeamRecord,
   ): Promise<TeamMateIdentityStatus | null> {
-    try {
-      return (await this.opts.teammates.status(team.dispatcher_id, team.leader_name))
-        .status;
-    } catch {
-      return null;
-    }
+    const leader = await this.opts.teammates
+      .statusScoped(this.teamPrincipal(team), team.leader_name)
+      .catch(() => null);
+    return leader?.status ?? null;
+  }
+
+  /** The internal Team-service authority over this Team (issue #199 Slice 4). */
+  private teamPrincipal(team: TeamRecord) {
+    return teamServicePrincipal({
+      dispatcherId: team.dispatcher_id,
+      teamId: team.team_id,
+      leaderName: team.leader_name,
+    });
   }
 
   /** The active bound Feishu group for a Team, or null when none is bound. */
@@ -452,7 +411,7 @@ export class TeamService {
   ): Promise<TeamChannelBindingSummary | null> {
     const bindings = await this.bindings.list(team.dispatcher_id);
     const active = bindings.find(
-      (binding) => binding.active && binding.team_id === team.team_id,
+      (binding) => binding.active && binding.team_name === team.team_id,
     );
     return active === undefined
       ? null
@@ -460,13 +419,18 @@ export class TeamService {
   }
 
   private async memberCount(team: TeamRecord): Promise<number> {
-    return (await this.opts.teammates.listScoped(
-      teamLeaderPrincipal({
-        dispatcherId: team.dispatcher_id,
-        teamId: team.team_id,
-        leaderName: team.leader_name,
-      }),
-    )).length;
+    return (await this.members(team)).length;
+  }
+
+  /**
+   * The Team's members only (issue #199 Slice 4): the internal Team-service
+   * authority can see both the leader and the members, so the leader (known by
+   * its concrete name) is filtered out of member listings.
+   */
+  private async members(team: TeamRecord): Promise<TeamMateRuntimeStatus[]> {
+    return (await this.opts.teammates.listScoped(this.teamPrincipal(team))).filter(
+      (member) => member.name !== team.leader_name,
+    );
   }
 
   private async mustTeam(dispatcherId: string, teamId: string): Promise<TeamRecord> {
@@ -474,6 +438,26 @@ export class TeamService {
     if (team === null) throw new Error(`Team ${JSON.stringify(teamId)} does not exist`);
     return team;
   }
+}
+
+/**
+ * Project the persisted {@link TeamRecord} into the public {@link TeamView}
+ * (issue #199 Slice 2): concrete `team_name`, no duplicate `name`/`team_id`, no
+ * machine-local `repo_cwd`/`runtime_cwd`/`worktree`.
+ */
+function teamView(team: TeamRecord): TeamView {
+  return {
+    team_name: team.team_id,
+    status: team.status,
+    intent: team.intent,
+    source_repo: team.source_repo,
+    leader_name: team.leader_name,
+    leader_agent_runtime: team.leader_agent_runtime,
+    created_at: team.created_at,
+    updated_at: team.updated_at,
+    closed_at: team.closed_at,
+    close_note: team.close_note,
+  };
 }
 
 function teamLeaderPrompt(team: TeamRecord): string {
@@ -489,18 +473,13 @@ function matchesTeamHistoryQuery(
   row: TeamHistoryRow,
   input: Omit<TeamHistoryQuery, 'dispatcherId'>,
 ): boolean {
-  if (input.name !== undefined && row.name !== validateTeamId(input.name)) {
+  if (input.name !== undefined && row.team_name !== validateTeamId(input.name)) {
     return false;
   }
   if (input.status !== undefined && row.status !== input.status) return false;
-  if (input.closeStatus !== undefined && row.close_status !== input.closeStatus) {
-    return false;
-  }
   if (input.repo !== undefined) {
     const needle = input.repo.toLowerCase();
-    const hit = [row.source_repo, row.repo_cwd].some(
-      (value) => value !== null && value.toLowerCase().includes(needle),
-    );
+    const hit = row.source_repo !== null && row.source_repo.toLowerCase().includes(needle);
     if (!hit) return false;
   }
   if (input.grep !== undefined && !teamRowMatchesText(row, input.grep)) {
@@ -515,10 +494,9 @@ function teamRowMatchesText(row: TeamHistoryRow, grep: string): boolean {
   const needle = grep.toLowerCase();
   if (needle === '') return true;
   return [
-    row.name,
+    row.team_name,
     row.intent,
     row.source_repo,
-    row.repo_cwd,
     row.leader_name,
     row.close_note,
   ].some((value) => value !== null && value.toLowerCase().includes(needle));

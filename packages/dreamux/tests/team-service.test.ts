@@ -9,7 +9,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AgentRuntimeProviderCatalog } from '../src/agent-runtime/index.js';
 import { TeamService } from '../src/dispatcher-service/team/service.js';
 import { TeamMateAgentService } from '../src/dispatcher-service/teammate/service.js';
-import { teamLeaderPrincipal } from '../src/dispatcher-service/teammate/types.js';
+import {
+  teamLeaderPrincipal,
+  teammatePrincipal,
+  teamServicePrincipal,
+} from '../src/dispatcher-service/teammate/types.js';
 import { DispatcherStore } from '../src/state/dispatcher-store.js';
 import { resetRuntimeConfig } from '../src/platform/paths.js';
 import { createBuiltinProviderRegistry } from '../src/registry/index.js';
@@ -176,38 +180,52 @@ describe('TeamService', () => {
     // #188: the Team's leader_name is a concrete, never-reused `tl-` name; the
     // human-readable `${teamId}-leader` survives only as the leader display name.
     expect(created.team.leader_name).toMatch(/^tl-alpha-[a-z0-9]{8}$/);
+    // #199 Slice 2: the public team view is keyed by team_name and drops the
+    // duplicate team_id and the machine-local repo_cwd / runtime_cwd / worktree.
     expect(created.team).toMatchObject({
-      team_id: 'alpha',
+      team_name: 'alpha',
       leader_agent_runtime: 'flow',
       status: 'running',
-      repo_cwd: repo,
       source_repo: repo,
     });
+    expect(created.team).not.toHaveProperty('team_id');
+    expect(created.team).not.toHaveProperty('repo_cwd');
+    expect(created.team).not.toHaveProperty('runtime_cwd');
+    // The leader carries the collapsed `repo` view; owner is the sole ownership
+    // authority (no public role/team_id/display_name on the teammate status).
     expect(created.leader).toMatchObject({
       name: created.team.leader_name,
-      display_name: 'alpha-leader',
-      role: 'team_leader',
       owner: { kind: 'dispatcher', dispatcher_id: 'flow' },
-      team_id: 'alpha',
     });
-    expect(existsSync(created.team.runtime_cwd)).toBe(true);
-    // Required intent (issue #182 PR-3) is persisted on the Team record.
+    expect(created.leader).not.toHaveProperty('display_name');
+    expect(created.leader).not.toHaveProperty('role');
+    expect(created.leader).not.toHaveProperty('team_id');
+    // The leader runs in the prepared team worktree (its repo.path exists).
+    expect(existsSync(created.leader!.repo.path)).toBe(true);
+    // Required intent (issue #182 PR-3) is persisted and surfaced on the view.
     expect(created.team.intent).toBe('ship alpha');
-    // #182 PR-7: list returns compact scan rows (name == team_id), not summaries.
+    // #182 PR-7: list returns compact scan rows, not summaries. #199 Slice 1:
+    // rows are keyed by the concrete team_name; the duplicate team_id and the
+    // machine-local repo_cwd / worktree_mode are no longer projected.
     const listed = await teams.list('flow');
-    expect(listed.map((entry) => entry.name)).toEqual(['alpha']);
+    expect(listed.map((entry) => entry.team_name)).toEqual(['alpha']);
     expect(listed[0]).toMatchObject({
-      team_id: 'alpha',
+      team_name: 'alpha',
       status: 'running',
       leader_name: created.team.leader_name,
       member_count: 0,
       bound_group: null,
     });
-    expect((await teams.ledger('flow', 'alpha')).events.map((event) => event.type)).toEqual(['create']);
+    expect(listed[0]).not.toHaveProperty('team_id');
+    expect(listed[0]).not.toHaveProperty('repo_cwd');
+    expect(listed[0]).not.toHaveProperty('worktree_mode');
 
     const reloaded = new TeamService({ teammates });
-    expect((await reloaded.status('flow', 'alpha')).team.team_id).toBe('alpha');
+    expect((await reloaded.status('flow', 'alpha')).team.team_name).toBe('alpha');
 
+    // #199 Slice 3: the team audit ledger JSONL was removed. Dissolve persists
+    // the closed status + the required note on the JSON team record, surfaced by
+    // status/history (no separate event stream).
     const dissolved = await reloaded.dissolve({
       dispatcherId: 'flow',
       teamId: 'alpha',
@@ -216,14 +234,53 @@ describe('TeamService', () => {
     expect(dissolved.team.status).toBe('closed');
     expect(dissolved.team.close_note).toBe('done');
     expect(dissolved.leader?.status).toBe('closed');
-    const ledger = (await reloaded.ledger('flow', 'alpha')).events;
-    expect(ledger.map((event) => event.type)).toEqual(['create', 'dissolve']);
-    // Required dissolve note (issue #182 PR-3) is the ledger summary — no
-    // synthetic 'team dissolved' fallback.
-    expect(ledger.find((e) => e.type === 'dissolve')?.summary).toBe('done');
+    const closedView = (await reloaded.history({ dispatcherId: 'flow', status: 'closed' }))
+      .items.find((item) => item.team_name === 'alpha');
+    expect(closedView?.close_note).toBe('done');
   });
 
-  it('captures a bound-channel TeamLeader turn in the session ledger (#182 PR-5, PR#187 P1)', async () => {
+  it('creates a team with no repo in a plain .workspace/work/<team_name> dir, members inherit it', async () => {
+    // #199: a Team with no `repo` runs the TeamLeader (and every member) in a
+    // plain `<dispatcher cwd>/.workspace/work/<team_name>/` directory — NOT a git
+    // worktree — so the dispatcher cwd need not be a git repo. dispatcherCwd is a
+    // plain (non-git) directory here.
+    const { teams, teammates } = buildServices();
+    const created = await teams.create({
+      dispatcherId: 'flow',
+      name: 'plain',
+      intent: 'work',
+      leaderAgentRuntime: 'flow',
+    });
+    expect(created.team).toMatchObject({
+      team_name: 'plain',
+      status: 'running',
+      source_repo: null,
+    });
+    expect(created.leader!.repo).toMatchObject({
+      mode: 'reuse-cwd',
+      source_repo: null,
+      cleanup_state: 'not-managed',
+    });
+    expect(created.leader!.repo.path).toMatch(/\/\.workspace\/work\/plain$/);
+    expect(existsSync(created.leader!.repo.path)).toBe(true);
+
+    // A member spawned by the TeamLeader inherits the SAME shared work dir.
+    const workspace = await teams.sharedWorkspace('flow', 'plain');
+    const member = await teammates.spawnScoped({
+      principal: teamLeaderPrincipal({
+        dispatcherId: 'flow',
+        teamId: 'plain',
+        leaderName: created.team.leader_name,
+      }),
+      name: 'builder',
+      intent: 'work',
+      prompt: 'build',
+      sharedWorkspace: workspace,
+    });
+    expect(member.teammate.repo.path).toBe(created.leader!.repo.path);
+  });
+
+  it('captures a bound-channel TeamLeader turn in the leader turns archive (#199 Slice 3)', async () => {
     const repo = await initGitRepo(join(root, 'channel-repo'));
     const { teams, teammates } = buildServices();
 
@@ -246,22 +303,19 @@ describe('TeamService', () => {
       turn: { text: 'please review the auth change', sourceId: 'msg-1' },
     });
 
-    const events = await teammates.sessions().read('flow');
-    const channelTurn = events.find((e) => e.turn_origin === 'channel');
+    // #199 Slice 3: the channel-origin turn is captured as a compact `submit`
+    // row in the LEADER's own per-name turns archive (no separate session ledger;
+    // the row carries turn-specific facts only — no name/role/team_id).
+    const turnRows = [];
+    for await (const row of teammates.turns().stream('flow', leaderName)) {
+      turnRows.push(row);
+    }
+    const channelTurn = turnRows.find((row) => row.turn_origin === 'channel');
     expect(channelTurn).toMatchObject({
-      type: 'send',
-      name: leaderName,
-      display_name: 'alpha-leader',
-      role: 'team_leader',
-      team_id: 'alpha',
-      leader_name: leaderName,
+      type: 'submit',
       turn_origin: 'channel',
       prompt_preview: 'please review the auth change',
     });
-    // Carries a stable session id (same as the leader's spawn), never re-keyed.
-    expect(channelTurn?.session_id).toBe(
-      events.find((e) => e.type === 'spawn' && e.name === leaderName)?.session_id,
-    );
   });
 
   it('recreating a closed Team persists the new create.intent (#182 PR-3 P1)', async () => {
@@ -305,9 +359,7 @@ describe('TeamService', () => {
       intent: 'first',
     });
     const firstLeader = first.team.leader_name;
-    const firstSession = first.leader.session_id;
     expect(firstLeader).toMatch(/^tl-alpha-[a-z0-9]{8}$/);
-    expect(firstSession).not.toBeNull();
     await teams.dissolve({ dispatcherId: 'flow', teamId: 'alpha', note: 'done' });
 
     const second = await teams.create({
@@ -318,12 +370,12 @@ describe('TeamService', () => {
       intent: 'second',
     });
     const secondLeader = second.team.leader_name;
-    // #188: a recreated closed Team gets a DISTINCT concrete leader name and a
-    // distinct session — the closed leader's concrete name is never reused.
+    // #188: a recreated closed Team gets a DISTINCT concrete leader name — the
+    // closed leader's concrete name is never reused (the name is the session
+    // identity now that the Dreamux-minted session id is gone, #199 Slice 3).
     expect(secondLeader).toMatch(/^tl-alpha-[a-z0-9]{8}$/);
     expect(secondLeader).not.toBe(firstLeader);
     expect(second.leader.name).toBe(secondLeader);
-    expect(second.leader.session_id).not.toBe(firstSession);
 
     // The Team record (reloaded) routes/statuses on the NEW concrete leader name.
     const reloaded = new TeamService({ teammates });
@@ -332,8 +384,12 @@ describe('TeamService', () => {
     expect(status.leader?.name).toBe(secondLeader);
 
     // Both leader identities persist; the old closed one is still addressable by
-    // its own concrete name (not reused, not deleted).
-    const oldLeader = await teammates.status('flow', firstLeader);
+    // its own concrete name (not reused, not deleted) through the Team-service
+    // authority — a TeamLeader is never on the dispatcher `teammate.*` surface.
+    const oldLeader = await teammates.statusScoped(
+      teamServicePrincipal({ dispatcherId: 'flow', teamId: 'alpha', leaderName: firstLeader }),
+      firstLeader,
+    );
     expect(oldLeader.status).toBe('closed');
     expect(oldLeader.name).toBe(firstLeader);
   });
@@ -415,27 +471,50 @@ describe('TeamService', () => {
     // A Team member gets the `tm-` rule (#188).
     expect(builderName).toMatch(/^tm-builder-[a-z0-9]{8}$/);
 
+    // #199 Slice 2: owner is the sole ownership/visibility authority (no public
+    // role); the work directory is reported through the collapsed `repo` view.
     expect(member.teammate).toMatchObject({
-      role: 'team_member',
-      display_name: 'builder',
       owner: {
         kind: 'team',
         dispatcher_id: 'flow',
         team_id: 'alpha',
         leader_name: alphaTeam.team.leader_name,
       },
-      runtime_cwd: workspace.runtimeCwd,
+      repo: { path: workspace.runtimeCwd },
     });
+    expect(member.teammate).not.toHaveProperty('role');
+    expect(member.teammate).not.toHaveProperty('display_name');
     expect(provider.contexts.at(-1)?.cwd).toBe(workspace.runtimeCwd);
-    // Dispatcher-scoped list sees the two leaders + the ungrouped teammate, by
-    // their display names (concrete names carry random suffixes).
-    expect((await teammates.list('flow')).map((entry) => entry.display_name).sort())
-      .toEqual(['alpha-leader', 'beta-leader', 'solo']);
-    expect((await teammates.listScoped(alpha)).map((entry) => entry.display_name)).toEqual(['builder']);
+    // #199 Slice 4 leak prevention: the dispatcher's teammate.* sees ONLY the
+    // ordinary teammate it spawned — never a TeamLeader and never a Team member.
+    // (concrete names carry a random 8-char suffix; identify by the base.)
+    const base = (name: string): string => name.replace(/-[a-z0-9]{8}$/, '');
+    expect((await teammates.list('flow')).map((entry) => base(entry.name)).sort())
+      .toEqual(['solo']);
+    // A TeamLeader is invisible to the dispatcher through status / last / history.
+    for (const leaderName of [alphaTeam.team.leader_name, betaTeam.team.leader_name]) {
+      await expect(teammates.status('flow', leaderName)).rejects.toThrow(/does not exist/);
+      await expect(teammates.last('flow', leaderName)).rejects.toThrow(/does not exist/);
+    }
+    // A Team member is invisible to the dispatcher too.
+    await expect(teammates.status('flow', builderName)).rejects.toThrow(/does not exist/);
+    expect(
+      (await teammates.history({ dispatcherId: 'flow' })).items.map((row) => base(row.name)),
+    ).toEqual(['solo']);
+    // A TeamLeader sees only the members of its OWN team — not the leaders, not
+    // the dispatcher's ordinary teammates, not another team's members.
+    expect((await teammates.listScoped(alpha)).map((entry) => base(entry.name))).toEqual([
+      'tm-builder',
+    ]);
     expect(await teammates.listScoped(beta)).toEqual([]);
     await expect(teammates.statusScoped(beta, builderName)).rejects.toThrow(/does not exist/);
     await expect(
       teammates.sendScoped({ principal: beta, name: builderName, prompt: 'nope' }),
+    ).rejects.toThrow(/does not exist/);
+    // An ordinary TeamMate principal can read no peers at all.
+    expect(await teammates.listScoped(teammatePrincipal('flow'))).toEqual([]);
+    await expect(
+      teammates.statusScoped(teammatePrincipal('flow'), builderName),
     ).rejects.toThrow(/does not exist/);
     await expect(
       teammates.closeScoped({ principal: beta, name: builderName, note: 'nope' }),
@@ -468,7 +547,7 @@ describe('TeamService', () => {
         chatId: 'oc_existing_group',
         chatType: 'group',
       }),
-    ).resolves.toMatchObject({ team_id: 'gamma' });
+    ).resolves.toMatchObject({ team_name: 'gamma' });
     expect((await teams.status('flow', 'gamma')).binding).toEqual({
       provider: 'builtin:feishu',
       chat_id: 'oc_existing_group',
@@ -499,7 +578,7 @@ describe('TeamService', () => {
     expect(page2.items).toHaveLength(1);
     expect(page2.next_cursor).toBeNull();
     // The two pages together cover all three Teams with no overlap.
-    const seen = [...page1.items, ...page2.items].map((row) => row.name).sort();
+    const seen = [...page1.items, ...page2.items].map((row) => row.team_name).sort();
     expect(seen).toEqual(['t-one', 't-three', 't-two']);
     // An invalid cursor fails loud rather than silently resetting to page 0.
     await expect(
@@ -529,29 +608,45 @@ describe('TeamService', () => {
 
     // No filters → both Teams, most-recent first (billing was touched last).
     const all = await teams.history({ dispatcherId: 'flow' });
-    expect(all.items.map((row) => row.name).sort()).toEqual([
+    expect(all.items.map((row) => row.team_name).sort()).toEqual([
       'auth-team',
       'billing-team',
     ]);
     expect(all.next_cursor).toBeNull();
 
-    // close_status filter isolates the dissolved Team and carries recovery facts.
-    const closed = await teams.history({ dispatcherId: 'flow', closeStatus: 'closed' });
-    expect(closed.items.map((row) => row.name)).toEqual(['billing-team']);
-    expect(closed.items[0]).toMatchObject({
-      close_status: 'closed',
+    // #199 Slice 1: rows are keyed by team_name. The dissolved Team is still
+    // recoverable and carries recovery facts, but the row no longer projects a
+    // close_status flag, the duplicate team_id, or machine-local cwd/worktree.
+    const dissolved = all.items.find((row) => row.team_name === 'billing-team');
+    expect(dissolved).toMatchObject({
       close_note: 'done',
       close_note_preview: 'done',
       source_repo: repo,
     });
+    for (const removed of ['close_status', 'team_id', 'repo_cwd', 'runtime_cwd', 'worktree']) {
+      expect(dissolved).not.toHaveProperty(removed);
+    }
 
-    // grep matches intent text; status filter narrows to live Teams.
+    // The lifecycle `status` filter survives (the legacy close_status is gone):
+    // 'running' isolates the live Team, 'closed' the dissolved one.
     expect(
-      (await teams.history({ dispatcherId: 'flow', grep: 'auth' })).items.map((r) => r.name),
+      (await teams.history({ dispatcherId: 'flow', status: 'running' })).items.map(
+        (r) => r.team_name,
+      ),
     ).toEqual(['auth-team']);
     expect(
-      (await teams.history({ dispatcherId: 'flow', status: 'running' })).items.map((r) => r.name),
+      (await teams.history({ dispatcherId: 'flow', status: 'closed' })).items.map(
+        (r) => r.team_name,
+      ),
+    ).toEqual(['billing-team']);
+
+    // grep matches intent text on either Team.
+    expect(
+      (await teams.history({ dispatcherId: 'flow', grep: 'auth' })).items.map((r) => r.team_name),
     ).toEqual(['auth-team']);
+    expect(
+      (await teams.history({ dispatcherId: 'flow', grep: 'billing' })).items.map((r) => r.team_name),
+    ).toEqual(['billing-team']);
 
     // Bind a group → it surfaces in list (bound_group) and status (binding).
     await teams.bindChannel({
@@ -562,7 +657,7 @@ describe('TeamService', () => {
       chatType: 'group',
     });
     const listed = await teams.list('flow');
-    const authRow = listed.find((row) => row.name === 'auth-team');
+    const authRow = listed.find((row) => row.team_name === 'auth-team');
     expect(authRow?.bound_group).toEqual({ provider: 'builtin:feishu', chat_id: 'chat-auth' });
     const status = await teams.status('flow', 'auth-team');
     expect(status.binding).toEqual({ provider: 'builtin:feishu', chat_id: 'chat-auth' });

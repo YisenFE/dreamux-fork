@@ -141,26 +141,25 @@ function teammateTools(
   callerKind: 'dispatcher' | 'team_leader' | 'teammate',
 ): Array<Record<string, unknown>> {
   const readTools = [
-    tool('history', 'List bounded TeamMate session ledger rows for recovery.', {
+    tool('history', 'Search this scope\'s TeamMate records for recovery (closed included). A compact recovery list keyed by concrete name, not a raw event timeline. Returns { items, next_cursor }.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
-      id: { type: 'string', minLength: 1, maxLength: 64 },
-      agent_runtime: { type: 'string', minLength: 1, maxLength: 128 },
-      state: {
+      status: {
         type: 'string',
-        enum: ['active', 'starting', 'running', 'degraded', 'closed', 'stopped'],
+        enum: ['starting', 'running', 'degraded', 'closed', 'stopped'],
       },
-      close_status: { type: 'string', enum: ['open', 'closed'] },
-      source_cwd: { type: 'string', minLength: 1, maxLength: 4096 },
-      runtime_cwd: { type: 'string', minLength: 1, maxLength: 4096 },
+      agent_runtime: { type: 'string', minLength: 1, maxLength: 128 },
+      repo: { type: 'string', minLength: 1, maxLength: 4096 },
       grep: { type: 'string', minLength: 1, maxLength: 500 },
+      since: { type: 'integer' },
+      until: { type: 'integer' },
       limit: { type: 'integer', minimum: 1, maximum: 100 },
       cursor: { type: 'string', minLength: 1, maxLength: 1000 },
     }, []),
-    tool('list', 'List this dispatcher\'s TeamMate identities (concrete name, display name, status, repo/cwd/session essentials).', {}, []),
+    tool('list', 'List this scope\'s TeamMate identities (compact rows: concrete name, owner, status, agent runtime, intent essentials).', {}, []),
     tool('status', 'Read one TeamMate identity and live runtime status by its concrete name.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
     }, ['name']),
-    tool('last', 'Read a TeamMate\'s most recent settled turn(s) from the durable session ledger by concrete name. Works for a closed/stopped TeamMate without starting a runtime; this is the fallback when a completion was not delivered. turns defaults to 1 (range 1..5); the newest turn is last.', {
+    tool('last', 'Read a TeamMate\'s most recent settled turn(s) by concrete name. Reads the TeamMate record first (existence / scope / common fields), then folds the recent settled turns from its per-name turns archive; it never starts or resumes a runtime, so it works for a closed/stopped TeamMate. This is the fallback when a completion was not delivered. turns defaults to 1 (range 1..5); the newest turn is last.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
       turns: { type: 'integer', minimum: 1, maximum: 5 },
     }, ['name']),
@@ -168,7 +167,7 @@ function teammateTools(
   ];
   if (callerKind === 'teammate') return readTools;
   const spawnProperties: Record<string, unknown> = {
-    name: { type: 'string', minLength: 1, maxLength: 64 },
+    name_prefix: { type: 'string', minLength: 1, maxLength: 64 },
     prompt: { type: 'string', minLength: 1, maxLength: 20000 },
     agent_runtime: {
       type: 'string',
@@ -178,30 +177,16 @@ function teammateTools(
     intent: { type: 'string', minLength: 1, maxLength: 2000 },
   };
   if (callerKind === 'dispatcher') {
-    spawnProperties['cwd'] = { type: 'string', minLength: 1, maxLength: 4096 };
-    spawnProperties['worktree'] = {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        mode: { type: 'string', enum: ['reuse-cwd', 'managed'] },
-        slug: { type: 'string', minLength: 1, maxLength: 64 },
-        base_ref: { type: 'string', minLength: 1, maxLength: 256 },
-        branch: { type: 'string', minLength: 1, maxLength: 256 },
-        cleanup: { type: 'string', enum: ['keep', 'delete-on-close'] },
-      },
-      required: ['mode'],
-    };
+    spawnProperties['repo'] = repoInputSchema();
   }
   return [
     tool(
       'spawn',
-      'Start a named, resumable TeamMate agent and submit its first turn. Use get_capabilities.agent_runtimes[].id as agent_runtime. intent is required: it is the durable recovery subject for the session ledger.',
+      'Start a resumable TeamMate agent and submit its first turn. name_prefix is the requested label; spawn RETURNS the concrete, never-reused name that all later send/status/last/close MUST use. Use get_capabilities.agent_runtimes[].id as agent_runtime. intent is required: it is the durable recovery subject. repo is optional: omit it to run in a fresh per-TeamMate work directory under the dispatcher workspace (.workspace/work/<name>/, a plain directory — the dispatcher cwd need not be a git repo), or pass { mode: reuse-cwd | managed, path?, base_ref?, branch?, slug?, cleanup? } — reuse-cwd runs in path, managed creates a git worktree.',
       spawnProperties,
-      callerKind === 'team_leader'
-        ? ['name', 'prompt', 'intent']
-        : ['name', 'prompt', 'cwd', 'intent'],
+      ['name_prefix', 'prompt', 'intent'],
     ),
-    tool('send', 'Send a turn to a TeamMate agent; reopens a closed one from its checkpoint first. Pass intent to update the recorded recovery subject before the turn.', {
+    tool('send', 'Send a turn to a TeamMate agent; reopens a closed one from the runtime-native session_id recorded on it (interpreted by its agent_runtime) first. Pass intent to update the recorded recovery subject before the turn.', {
       name: { type: 'string', minLength: 1, maxLength: 64 },
       prompt: { type: 'string', minLength: 1, maxLength: 20000 },
       intent: { type: 'string', minLength: 1, maxLength: 2000 },
@@ -349,48 +334,22 @@ function spawnArgs(
   const intent = requireString(obj, 'intent');
   if (callerKind === 'team_leader') {
     return {
-      name: requireString(obj, 'name'),
+      name_prefix: requireString(obj, 'name_prefix'),
       prompt: requireString(obj, 'prompt'),
       intent,
       ...(agentRuntime !== null ? { agent_runtime: agentRuntime } : {}),
     };
   }
-  const worktree = optionalWorktree(obj, 'worktree');
+  // #199 Slice 2: the public work-directory input is a single optional `repo`
+  // object (replacing the old required `cwd` + `worktree`). Omitted → the server
+  // creates a plain per-name work dir (.workspace/work/<name>/, issue #199).
+  const repo = optionalRepoInput(obj, 'repo');
   return {
-    name: requireString(obj, 'name'),
+    name_prefix: requireString(obj, 'name_prefix'),
     prompt: requireString(obj, 'prompt'),
-    cwd: requireString(obj, 'cwd'),
     intent,
     ...(agentRuntime !== null ? { agent_runtime: agentRuntime } : {}),
-    ...(worktree !== null ? { worktree } : {}),
-  };
-}
-
-function optionalWorktree(
-  obj: Record<string, unknown>,
-  key: string,
-): Record<string, unknown> | null {
-  const value = obj[key];
-  if (value === undefined || value === null) return null;
-  const worktree = asRecord(value, key);
-  const mode = requireString(worktree, 'mode');
-  if (mode !== 'reuse-cwd' && mode !== 'managed') {
-    throw new Error(`${key}.mode must be 'reuse-cwd' or 'managed'`);
-  }
-  const cleanup = optionalString(worktree, 'cleanup');
-  if (
-    cleanup !== null &&
-    cleanup !== 'keep' &&
-    cleanup !== 'delete-on-close'
-  ) {
-    throw new Error(`${key}.cleanup must be 'keep' or 'delete-on-close'`);
-  }
-  return {
-    mode,
-    ...optionalProp(worktree, 'slug'),
-    ...optionalProp(worktree, 'base_ref'),
-    ...optionalProp(worktree, 'branch'),
-    ...(cleanup !== null ? { cleanup } : {}),
+    ...(repo !== null ? { repo } : {}),
   };
 }
 
@@ -400,6 +359,59 @@ function optionalProp(
 ): Record<string, string> {
   const value = optionalString(obj, key);
   return value === null ? {} : { [key]: value };
+}
+
+/**
+ * Public `repo` input schema (issue #199 Slice 2), shared by `teammate.spawn`
+ * and `team.create`: omit it for a plain per-name work dir under the dispatcher
+ * workspace (`.workspace/work/<name>/`, no git repo required), or choose a
+ * repository work mode (`reuse-cwd` runs in `path`; `managed` creates a git
+ * worktree).
+ */
+export function repoInputSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      mode: { type: 'string', enum: ['reuse-cwd', 'managed'] },
+      path: { type: 'string', minLength: 1, maxLength: 4096 },
+      base_ref: { type: 'string', minLength: 1, maxLength: 256 },
+      branch: { type: 'string', minLength: 1, maxLength: 256 },
+      slug: { type: 'string', minLength: 1, maxLength: 64 },
+      cleanup: { type: 'string', enum: ['keep', 'delete-on-close'] },
+    },
+    required: ['mode'],
+  };
+}
+
+/**
+ * Validate and normalize the optional `repo` input object, returned verbatim for
+ * the admin layer to map onto the internal cwd + worktree request. `managed`
+ * worktree fields are ignored for `reuse-cwd`.
+ */
+export function optionalRepoInput(
+  obj: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> | null {
+  const value = obj[key];
+  if (value === undefined || value === null) return null;
+  const repo = asRecord(value, key);
+  const mode = requireString(repo, 'mode');
+  if (mode !== 'reuse-cwd' && mode !== 'managed') {
+    throw new Error(`${key}.mode must be 'reuse-cwd' or 'managed'`);
+  }
+  const cleanup = optionalString(repo, 'cleanup');
+  if (cleanup !== null && cleanup !== 'keep' && cleanup !== 'delete-on-close') {
+    throw new Error(`${key}.cleanup must be 'keep' or 'delete-on-close'`);
+  }
+  return {
+    mode,
+    ...optionalProp(repo, 'path'),
+    ...optionalProp(repo, 'slug'),
+    ...optionalProp(repo, 'base_ref'),
+    ...optionalProp(repo, 'branch'),
+    ...(cleanup !== null ? { cleanup } : {}),
+  };
 }
 
 function sendArgs(value: unknown): Record<string, unknown> {
@@ -426,34 +438,44 @@ function closeArgs(value: unknown): Record<string, unknown> {
 function historyArgs(value: unknown): Record<string, unknown> {
   const obj = asRecord(value, 'history arguments');
   const name = optionalString(obj, 'name');
-  const id = optionalString(obj, 'id');
-  const agentRuntime = optionalString(obj, 'agent_runtime');
-  const state = optionalEnum(obj, 'state', [
-    'active',
+  const status = optionalEnum(obj, 'status', [
     'starting',
     'running',
     'degraded',
     'closed',
     'stopped',
   ]);
-  const closeStatus = optionalEnum(obj, 'close_status', ['open', 'closed']);
-  const sourceCwd = optionalString(obj, 'source_cwd');
-  const runtimeCwd = optionalString(obj, 'runtime_cwd');
+  const agentRuntime = optionalString(obj, 'agent_runtime');
+  const repo = optionalString(obj, 'repo');
   const grep = optionalString(obj, 'grep');
+  const since = optionalInteger(obj, 'since');
+  const until = optionalInteger(obj, 'until');
   const limit = optionalInteger(obj, 'limit');
   const cursor = optionalString(obj, 'cursor');
   return {
     ...(name !== null ? { name } : {}),
-    ...(id !== null ? { id } : {}),
+    ...(status !== null ? { status } : {}),
     ...(agentRuntime !== null ? { agent_runtime: agentRuntime } : {}),
-    ...(state !== null ? { state } : {}),
-    ...(closeStatus !== null ? { close_status: closeStatus } : {}),
-    ...(sourceCwd !== null ? { source_cwd: sourceCwd } : {}),
-    ...(runtimeCwd !== null ? { runtime_cwd: runtimeCwd } : {}),
+    ...(repo !== null ? { repo } : {}),
     ...(grep !== null ? { grep } : {}),
+    ...(since !== null ? { since } : {}),
+    ...(until !== null ? { until } : {}),
     ...(limit !== null ? { limit } : {}),
     ...(cursor !== null ? { cursor } : {}),
   };
+}
+
+function optionalEnum(
+  obj: Record<string, unknown>,
+  key: string,
+  values: string[],
+): string | null {
+  const value = optionalString(obj, key);
+  if (value === null) return null;
+  if (!values.includes(value)) {
+    throw new Error(`${key} must be one of: ${values.join(', ')}`);
+  }
+  return value;
 }
 
 function nameArgs(value: unknown): Record<string, unknown> {
@@ -497,19 +519,6 @@ function optionalInteger(obj: Record<string, unknown>, key: string): number | nu
   if (value === undefined || value === null) return null;
   if (!Number.isInteger(value)) throw new Error(`${key} must be an integer`);
   return value as number;
-}
-
-function optionalEnum(
-  obj: Record<string, unknown>,
-  key: string,
-  values: string[],
-): string | null {
-  const value = optionalString(obj, key);
-  if (value === null) return null;
-  if (!values.includes(value)) {
-    throw new Error(`${key} must be one of: ${values.join(', ')}`);
-  }
-  return value;
 }
 
 function okResponse(id: JsonRpcRequest['id'], result: unknown): string {

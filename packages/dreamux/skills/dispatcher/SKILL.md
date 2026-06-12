@@ -1,6 +1,6 @@
 ---
 name: dispatcher
-description: Use from a Dreamux dispatcher thread when bounded repository work should be delegated to a TeamMate. The server-hosted TeamMate MCP is the default interface; spawn creates a semi-resident TeamMate and RETURNS its concrete name (use that name for every later call), send submits follow-up turns and reopens a closed TeamMate from its checkpoint, close stops one, history searches the durable session ledger, and list/status/last/get_capabilities inspect state. The tm CLI is the explicit fallback for legacy diagnostics. Applies to spawning, tracking, retrieving, sending, closing, inspecting, reopening, recovering, or summarizing teammate work.
+description: Use from a Dreamux dispatcher thread when bounded repository work should be delegated to a TeamMate. The server-hosted TeamMate MCP is the default interface; spawn creates a semi-resident TeamMate and RETURNS its concrete name (use that name for every later call), send submits follow-up turns and reopens a closed TeamMate from its recorded runtime-native session_id, close stops one, history searches the durable per-name records, and list/status/last/get_capabilities inspect state. The tm CLI is the explicit fallback for legacy diagnostics. Applies to spawning, tracking, retrieving, sending, closing, inspecting, reopening, recovering, or summarizing teammate work.
 ---
 
 # Dispatcher
@@ -20,39 +20,52 @@ habit.
 Dreamux injects a dispatcher-scoped `teammate` MCP server. It creates named
 semi-resident TeamMate agents through the same AgentRuntime contract as
 dispatchers, then lets you submit follow-up turns, reopen closed agents from
-their checkpoint, inspect state, and close agents without holding a shell
-session or polling a process.
+their recorded runtime-native session_id, inspect state, and close agents
+without holding a shell session or polling a process.
 
 **Lifecycle.**
 
-- `spawn` — create a TeamMate and submit the first turn. The `name` you pass is
-  a requested label / base slug, **not** the final address: the service
-  allocates a concrete, never-reused name and returns it as `teammate.name`.
+- `spawn` — create a TeamMate and submit the first turn. The `name_prefix` you
+  pass is a requested label, **not** the final address: the service allocates a
+  concrete, never-reused name and returns it as `teammate.name`.
   **Use that returned concrete name for every later `send`/`status`/`last`/
-  `close`.** Your requested label is preserved as `display_name` for display.
-  `intent` is **required**: a short recovery subject for the session ledger
-  (what this TeamMate is for). When selecting a runtime, pass one of
+  `close`.** `intent` is **required**: a short recovery subject for the record
+  (what this TeamMate is for). The work directory is an optional `repo` object
+  (issue #199 Slice 2) — `{ mode: reuse-cwd | managed, path?, base_ref?, branch?,
+  slug?, cleanup? }`; omit it to run in a fresh per-TeamMate work dir
+  (`<dispatcher cwd>/.workspace/work/<name>/`, a plain directory — the dispatcher
+  cwd need not be a git repo), or pass `mode: managed` for an isolated git
+  worktree. When selecting a runtime, pass one of
   `get_capabilities.agent_runtimes[].id` as `agent_runtime`; do not pass provider
   refs such as `builtin:*`.
 - `send` — submit a turn to a TeamMate by its concrete name. If it is not live —
-  including one previously `close`d — send first reopens it from its persisted
-  checkpoint, then submits. There is no separate `resume` verb; send covers
-  reattach. Pass `intent` (optional) to update the recorded recovery subject
-  when the work shifts.
+  including one previously `close`d — send first reopens it from its recorded
+  runtime-native `session_id` (the `agent_runtime` rebuilds the resume from it),
+  then submits. There is no separate `resume` verb; send covers reattach. Pass
+  `intent` (optional) to update the recorded recovery subject when the work
+  shifts.
 - `close` — stop the TeamMate (by concrete name) and mark it closed. `note` is
   **required**: why you are stopping a recoverable session. It stays reopenable:
-  a later `send` revives it from its checkpoint.
+  a later `send` revives it from its recorded runtime-native `session_id`.
 
 **Watch and collect — no polling.**
 
-- `list` — this dispatcher's TeamMates: concrete name, display name, status, and
-  repo/cwd/session essentials.
-- `status` — one TeamMate's current state by concrete name: display name, agent
-  runtime id, session, cwd/repo, checkpoint, and close metadata.
-- `history` — the durable session-ledger search surface for this dispatcher,
-  with recovery filters across TeamMates (name/state/repo/grep/cursor).
-- `last` — a TeamMate's most recent settled turn(s), read from the durable
-  session ledger by concrete name. It accepts `turns` (1..5, default 1; newest
+- `list` — this dispatcher's TeamMates: concrete name, owner, status, agent
+  runtime, intent, and a compact `repo` view.
+- `status` — one TeamMate's current state by concrete name: owner, agent
+  runtime id, the runtime-native `session_id` (the thread id, null until known),
+  a compact `repo` view, and close metadata. The public role/team_id, the
+  Dreamux-made session id, `display_name`, and the runtime `checkpoint` are no
+  longer surfaced (issue #199 Slice 2) — `owner` is the ownership authority.
+- `history` — the durable recovery search for this dispatcher: a compact list
+  keyed by concrete name (filter by `name` / `status` / `agent_runtime` / `repo`
+  / `grep` / `since` / `until`, paginate with `limit` / `cursor`), returning
+  `{ items, next_cursor }`. It is a recovery list, not a raw event timeline. The
+  lifecycle `status` filter is kept; the legacy `state` / `close_status` /
+  `source_cwd` / `runtime_cwd` filters and the cwd/worktree/`display_name`/
+  `session_id`/`checkpoint` row fields are no longer exposed (issue #199).
+- `last` — a TeamMate's most recent settled turn(s), read from the per-name
+  turns archive by concrete name. It accepts `turns` (1..5, default 1; newest
   last) and returns the final assistant output as completely as it was durably
   captured (with a truncation flag). It does **not** start or resume a runtime,
   so it works for a closed or stopped TeamMate — this is your fallback when a
@@ -66,26 +79,33 @@ the dispatcher turn end, then recover through `history` and `last`. (The former
 **Team lifecycle.**
 
 Dreamux also injects a dispatcher-scoped `team` MCP server for Team Mode
-lifecycle. It is addressed by **Team name** (the same value you create with),
-mirroring the TeamMate read-surface model. Team work still runs through agents;
+lifecycle. It is addressed by **`team_name`** (the concrete key you create with),
+mirroring the TeamMate concrete-name model. Team work still runs through agents;
 do not inspect the target repo directly from the dispatcher.
 
-- `create` — create a Team and TeamLeader. Requires `repo_cwd`,
+- `create` — create a Team and TeamLeader. Requires `team_name`,
   `leader_agent_runtime`, and `intent` (the Team's recovery subject); no default
-  leader runtime is inferred. Optionally pass `bind_group: { chat_id }` to bind
-  an EXISTING Feishu group chat to the new Team at create time. (The former
-  `create_group` tool — create a brand-new Feishu group and invite users — was
-  retired; bind an existing group instead.)
-- `list` — compact scan rows for current Teams (name, status, intent, repo
+  leader runtime is inferred. The work directory is the same optional `repo`
+  object as `teammate.spawn` (issue #199 Slice 2; omit it for a plain shared
+  `<dispatcher cwd>/.workspace/work/<team_name>/` dir — no git repo required —
+  or pass `mode: managed` for a git worktree). Optionally pass `bind_group: { chat_id }`
+  to bind an EXISTING Feishu group chat to the new Team at create time. (The
+  former `create_group` tool — create a brand-new Feishu group and invite users —
+  was retired; bind an existing group instead.)
+- `list` — compact scan rows for current Teams (team_name, status, intent, repo
   signal, leader name/state, member count, bound group marker, timestamps). Keep
   it cheap and scannable; reach for `status` for detail.
-- `status` — one Team's detailed current state by name: the Team record, the
-  TeamLeader status/session, member count, and the active bound group.
+- `status` — one Team's detailed current state by `team_name`: the public team
+  view (keyed by `team_name`, no `team_id` / machine-local `repo_cwd` /
+  `worktree`; issue #199 Slice 2), the TeamLeader status, member count, and the
+  active bound group.
 - `history` — the durable Team recovery search (closed Teams included): filter by
-  `name`, `status`, `close_status`, `repo`, `intent` text (`grep`), and time
-  range (`since`/`until`), with `limit`/`cursor`. This is the recovery interface;
-  the raw per-Team lifecycle event timeline stays internal.
-- `bind_group` — bind an existing Feishu group chat to a Team by name and
+  `team_name`, `status`, `repo`, `intent` text (`grep`), and time range
+  (`since`/`until`), with `limit`/`cursor`, returning `{ items, next_cursor }`.
+  This is the recovery list, not a raw event timeline. The lifecycle `status`
+  filter is kept; the legacy `close_status` filter and the `team_id` / cwd /
+  worktree row fields are no longer exposed (issue #199).
+- `bind_group` — bind an existing Feishu group chat to a Team by `team_name` and
   `chat_id` (group chats only; no `chat_type`).
 - `transfer_channel_back` — return a bound Feishu group chat (`chat_id`) to the
   dispatcher.
@@ -102,9 +122,10 @@ do not inspect the target repo directly from the dispatcher.
   Control is an external Claude UI surface, distinct from Dreamux `send` steer;
   keep trusting `steer.supported` from the returned capabilities.
 
-The persistent identity and history files are the source of truth. A TeamMate
-reopened by send continues from its saved runtime checkpoint; do not create a
-new name unless you want a separate session.
+The persistent record and turns files are the source of truth. A TeamMate
+reopened by send resumes from its saved runtime-native session (the resume
+checkpoint is rebuilt from it); do not create a new name unless you want a
+separate session.
 
 ### tm CLI — the explicit fallback
 
@@ -184,7 +205,8 @@ on a flag -- do not infer one verb's flags from another.
 
 These references cover the `tm` fallback path. For ordinary delegation —
 spawning a TeamMate, sending follow-up turns (which also reopens a closed one
-from its checkpoint), checking status, or reading history/last — use the
+from its recorded runtime-native session_id), checking status, or reading
+history/last — use the
 `teammate` MCP tools above and you do not need a reference.
 Read the matching reference when you have dropped to `tm`:
 
@@ -218,10 +240,10 @@ turn's tool calls.
 Two state owners, kept distinct:
 
 - The Dreamux server owns the TeamMate **agent state** behind the `teammate`
-  MCP — concrete identities (with their display labels), runtime checkpoints,
-  status, and the durable session ledger (prompts and captured assistant
-  output). Read and control it with `list`, `status`, `history`, `last`,
-  `send`, and `close`.
+  MCP — per-name records (identity + a rolling recovery summary) and a per-name
+  turns archive (prompts and captured assistant output that `last` returns).
+  Read and control it with `list`, `status`, `history`, `last`, `send`, and
+  `close`.
 - `tm` owns live tm **session** state — teammate liveness, worktrees, and
   resumable session history (see `references/inspect-and-resume.md`).
 

@@ -32,7 +32,14 @@ export interface TeamRecord {
 export interface TeamCreateInput {
   dispatcherId: string;
   name: string;
-  repoCwd: string;
+  /**
+   * Explicit repository cwd for the Team workspace (issue #199). Omitted when
+   * the caller passes no `repo`: the Team then runs in a plain
+   * `<dispatcher cwd>/.workspace/work/<team_name>/` directory (no git worktree,
+   * dispatcher cwd need not be a git repo). A managed git worktree is created
+   * only for an explicit `worktree` request.
+   */
+  repoCwd?: string;
   leaderAgentRuntime: string;
   worktree?: TeamMateWorktreeRequest;
   /** Required recovery subject for the Team (issue #182 PR-3). */
@@ -49,7 +56,7 @@ export interface TeamCreateInput {
 export interface TeamDissolveInput {
   dispatcherId: string;
   teamId: string;
-  /** Required dissolve reason recorded in the ledger (issue #182 PR-3). */
+  /** Required dissolve reason recorded on the team record (issue #182 PR-3). */
   note: string;
 }
 
@@ -68,27 +75,6 @@ export interface TeamTransferChannelBackInput {
   chatType: 'group' | 'p2p';
 }
 
-export type TeamLedgerEventType =
-  | 'create'
-  | 'status'
-  | 'artifact'
-  | 'decision'
-  | 'bind_channel'
-  | 'transfer_channel_back'
-  | 'create_group'
-  | 'leader_turn'
-  | 'dissolve';
-
-export interface TeamLedgerEvent {
-  version: 1;
-  event_id: number;
-  timestamp: number;
-  dispatcher_id: string;
-  team_id: string;
-  type: TeamLedgerEventType;
-  summary: string;
-}
-
 /**
  * Active group binding marker surfaced by the Team read tools (issue #182 PR-7).
  * Bindings are always Feishu group chats, so only the chat id varies.
@@ -98,8 +84,28 @@ export interface TeamChannelBindingSummary {
   chat_id: string;
 }
 
+/**
+ * Public Team record view (issue #199 Slice 2). The status surface speaks the
+ * concrete `team_name`; the duplicate `name` / `team_id`, the machine-local
+ * `repo_cwd` / `runtime_cwd` / flattened `worktree`, and the persisted `version`
+ * are projected away. The persisted {@link TeamRecord} keeps them for internal
+ * orchestration and storage (the storage rewrite is Slice 3).
+ */
+export interface TeamView {
+  team_name: string;
+  status: TeamStatus;
+  intent: string | null;
+  source_repo: string | null;
+  leader_name: string;
+  leader_agent_runtime: string;
+  created_at: number;
+  updated_at: number;
+  closed_at: number | null;
+  close_note: string | null;
+}
+
 export interface TeamSummary {
-  team: TeamRecord;
+  team: TeamView;
   leader: TeamMateRuntimeStatus | null;
   member_count: number;
   /** The active bound group chat, or null when no group is bound (issue #182 PR-7). */
@@ -107,19 +113,15 @@ export interface TeamSummary {
 }
 
 /**
- * Cheap scan row for `team.list` (issue #182 PR-7), mirroring the TeamMate
- * `list`/`status` split: compact current-Team fields only, no inlined leader
- * runtime status or full worktree record. Reach for `team.status` for detail.
+ * Compact scan row for `team.list` (issue #199 Slice 1/2). Keyed by the concrete
+ * `team_name`; the duplicate `team_id` and the machine-local `repo_cwd` /
+ * `worktree_mode` are no longer projected — reach for `team.status` for detail.
  */
 export interface TeamListRow {
-  /** Public Team identifier; equal to `team_id` (the storage key) today. */
-  name: string;
-  team_id: string;
+  team_name: string;
   status: TeamStatus;
   intent: string | null;
   source_repo: string | null;
-  repo_cwd: string;
-  worktree_mode: TeamMateWorktreeIdentity['mode'];
   leader_name: string;
   leader_state: TeamMateIdentityStatus | null;
   member_count: number;
@@ -133,16 +135,16 @@ export interface TeamListRow {
  * Filterable recovery search over Teams (issue #182 PR-7), the Team-side mirror
  * of the TeamMate `history` surface: it finds Teams (including closed ones) by
  * name / status / repo / intent text / time range, rather than reading one
- * team's raw lifecycle event timeline (which stays an internal/debug ledger).
+ * team's raw lifecycle event timeline (which no longer exists).
  */
 export interface TeamHistoryQuery {
   dispatcherId: string;
   name?: string;
+  /** Lifecycle status filter (the retired `close_status` is gone). */
   status?: TeamStatus;
-  closeStatus?: 'open' | 'closed';
   /** Substring match over `source_repo` / `repo_cwd`. */
   repo?: string;
-  /** Substring match over name / intent / repo / leader name. */
+  /** Substring match over team_name / intent / repo / leader name. */
   grep?: string;
   /** Inclusive lower/upper bounds on `updated_at`. */
   since?: number;
@@ -151,16 +153,16 @@ export interface TeamHistoryQuery {
   cursor?: string;
 }
 
+/**
+ * Public Team recovery row (issue #199 Slice 1). A compact projection keyed by
+ * the concrete `team_name` (`name`): no `team_id`, no `close_status` duplicate of
+ * `status`, and no machine-local `repo_cwd`/`runtime_cwd`/`worktree` paths.
+ */
 export interface TeamHistoryRow {
-  name: string;
-  team_id: string;
+  team_name: string;
   status: TeamStatus;
-  close_status: 'open' | 'closed';
   intent: string | null;
   source_repo: string | null;
-  repo_cwd: string;
-  runtime_cwd: string;
-  worktree: TeamMateWorktreeIdentity;
   leader_name: string;
   leader_agent_runtime: string;
   leader_state: TeamMateIdentityStatus | null;
@@ -180,11 +182,6 @@ export interface TeamHistoryResult {
 
 export interface TeamCreateResult extends TeamSummary {
   turn: TeamMateTurnResult;
-}
-
-export interface TeamLedgerResult {
-  team: TeamRecord | null;
-  events: TeamLedgerEvent[];
 }
 
 export function validateTeamId(id: string): string {

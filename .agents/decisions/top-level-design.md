@@ -208,7 +208,7 @@ Rules:
 - `app_secret` must be redacted from `config show`, `status`, `doctor`, and
   logs.
 - A top-level `codex` block is **not** supported: it is rejected loudly on
-  load with migration guidance. All Codex settings are per-dispatcher.
+  load with rebuild guidance. All Codex settings are per-dispatcher.
 - Pre-providerized `dispatchers[].feishu` and `dispatchers[].codex` blocks are
   **not** silently migrated. They fail loudly with v2 rebuild guidance.
 - `runtime.config.bin` (default `"codex"`) is that dispatcher's Codex binary
@@ -234,6 +234,25 @@ Rules:
 
 State and logs are server-owned. They are not operator-editable config.
 
+### 0.x Upgrade Policy
+
+Dreamux is a bootstrap project during 0.x, so incompatible config, state,
+cache, and workspace-local file shape changes must not accumulate automatic
+migrations or legacy compatibility bridges. A current reader has two allowed
+behaviors: accept the current schema, or fail loudly with exact
+rebuild/delete/onboard guidance. Server-owned state that is explicitly
+rebuildable may warn-and-recreate or warn-and-drop when the loss is documented
+and safe; authorization, TeamMate/Team recovery records, and other
+user-meaningful durable facts fail instead of being inferred.
+
+Removed whole-file or directory layouts may be detected only to produce
+diagnostics (for example during `dreamux serve` startup or `dreamux doctor`);
+the detector must not read them as source data, transform them, or delete them.
+Removed fields in otherwise-current files are rejected by the owning reader.
+The changelog is the upgrade-time contract: breaking entries must explain what
+to rebuild. Prefer pruning runtime compatibility code over carrying 0.x
+migrations forward.
+
 The tree splits volatile run files (`run/`) and rebuildable cache (`cache/`)
 from durable state (`state/`); see
 [runtime-run-root](runtime-run-root.md) for the run/cache decision.
@@ -256,17 +275,18 @@ from durable state (`state/`); see
       access.json
       chat-bots.json
       teammate/
-        identities/
-          <name>.json          one TeamMate identity/checkpoint per file
-        sessions.jsonl         per-dispatcher session ledger (issue #182 PR-5)
+        records/
+          <name>.json          primary TeamMate record: identity + rolling
+                               recovery summary (issue #199 Slice 3)
+        turns/
+          <name>.jsonl         per-name turns archive — the ONLY JSONL store;
+                               compact submit/settled turn rows folded by `last`
         runtime/
           <name>/              runtime-private config/control state (no sockets)
       team/
         records/
-          <team-id>.json        Team lifecycle record and TeamLeader pointer
-        ledger/
-          <team-id>.jsonl       append-only Team lifecycle ledger
-        channel-bindings.json   Team ↔ Feishu group bindings
+          <team-name>.json      Team lifecycle record and TeamLeader pointer
+        channel-bindings.json   Team ↔ Feishu group bindings (JSON only)
   logs/
     dreamux-server.log
     daemon.stdout.log          when run as a daemon (onboard service redirect)
@@ -304,14 +324,20 @@ dispatcher's own workspace:
     .gitignore                 self-ignores the whole subtree (`*`)
     worktree/
       <repo-slug>/             <sanitized-basename>-<sha256(repo-root):12>
-        <slug>/                one managed TeamMate/Team worktree
+        <slug>/                one managed TeamMate/Team git worktree
+    work/
+      <name>/                  default (no-`repo`) plain TeamMate/Team work dir
 ```
 
-`.workspace/` self-ignores so managed worktrees never become repo content;
-`<repo-slug>` disambiguates same-named repos across Team/TeamMate usage. Managed
-worktree creation fails loud if the workspace resolves under `~/.dreamux`. Legacy
-identity records still pointing at the old under-state path are read verbatim (no
-rewrite, no deletion); only newly created managed worktrees use the new location.
+`.workspace/` self-ignores so neither managed worktrees nor default work dirs
+ever become repo content; `<repo-slug>` disambiguates same-named repos across
+Team/TeamMate usage. The default `work/<name>/` dir (issue #199) is a plain
+`mkdir -p` directory used when a `spawn`/`create` omits `repo` — no git command
+runs, so the dispatcher cwd need not be a git repo. Both managed-worktree and
+default-work-dir creation fail loud if the workspace resolves under `~/.dreamux`.
+Legacy identity records still pointing at the old under-state path are read
+verbatim (no rewrite, no deletion); only newly created worktrees use the new
+location.
 
 Host logging (issue #70): `dreamux serve`, the Feishu channel (gate
 deliver/drop, inbound submit, outbound, `/introduce`), and dispatcher lifecycle
@@ -667,27 +693,63 @@ agents. The shim is also a per-dispatcher stdio process:
 
 The dispatcher-facing tools are `spawn`, `send`, `close`, `history`,
 `list`, `status`, `last`, and `get_capabilities`
-(issue #155 removed the `resume` verb; `send` reopens a closed teammate from its
-checkpoint). Issue #188 removed the `ctx` and `history_events` verbs: `history`
-is the durable session-ledger search surface and `last` reads a teammate's most
-recent settled turn(s) from that ledger (see below). Lifecycle
-tools forward
-to `dreamux serve` over the local admin socket; the server owns the
-per-dispatcher TeamMate identities, runtime checkpoints, and session ledger
-under `state/<dispatcher-id>/teammate/`. Issue #169 made `spawn.cwd`
-required and added optional managed worktree isolation:
-`spawn({ name, prompt, cwd, intent, worktree?, agent_runtime? })`. Issue #182
-PR-3 made `spawn.intent` and `close.note` required (the durable recovery subject
-and the close reason for the session ledger), added an optional `send.intent`
-that updates the recorded subject before the turn, and dropped the synthetic
-`'team dissolved'` fallback. A reuse-cwd teammate
-runs in the caller-supplied `cwd`; a managed teammate runs only in its prepared
-worktree and persists source cwd/repo, runtime cwd, worktree branch/base ref,
-cleanup policy/state, and a default dispatcher `owner` field on the identity.
+(issue #155 removed the `resume` verb; `send` reopens a closed teammate).
+Issue #188 removed the `ctx` and `history_events` verbs.
+
+**As of issue #199 (the final contract).** `spawn` takes a requested
+`name_prefix` and returns the concrete, never-reused `name`; the work directory
+is a single optional `repo` object (`{ mode: reuse-cwd | managed, path?,
+base_ref?, branch?, slug?, cleanup? }`; omitted → a plain per-name work
+directory under the dispatcher workspace,
+`<dispatcher cwd>/.workspace/work/<name>/`, created with `mkdir -p` and NOT a git
+worktree, so the dispatcher cwd need not be a git repo; `team.create` likewise
+defaults to a shared `.workspace/work/<team_name>/` dir), replacing the old
+required `cwd` + `worktree`. `spawn.intent` and
+`close.note` stay required; `send.intent` optionally updates the recovery
+subject. `history` / `list` / `status` are backed by the per-name records
+(`state/<dispatcher-id>/teammate/records/<name>.json`: identity + a rolling
+recovery summary) — `history` is a records search, not an event fold — and
+`last` reads the record first (existence/scope), then folds the per-name turns
+archive (`teammate/turns/<name>.jsonl`, the only JSONL store) without starting or
+resuming a runtime, so a closed/stopped teammate stays recoverable. `session_id`
+is the runtime-native thread id (persisted directly; early `null` acceptable);
+the former Dreamux-minted ledger key, the persisted `checkpoint` object, and the
+`checkpoint_kind` / `session_ref` durable fields are gone — the resume checkpoint
+kind is rebuilt from the runtime. Lifecycle tools forward to `dreamux serve` over
+the local admin socket. A default (no-`repo`) teammate runs in its plain
+`.workspace/work/<name>/` dir (persisted as a `reuse-cwd` worktree with
+`source_repo: null`); a `reuse-cwd` teammate runs in the resolved work
+directory; a managed teammate runs only in its prepared git worktree and persists
+source cwd/repo, runtime cwd, worktree branch/base ref, cleanup policy/state, and
+a default dispatcher `owner` field on the record.
 Old identities without owner/worktree metadata read as dispatcher-owned
 reuse-cwd records until the next lifecycle mutation rewrites them. A caller
 marked as `teammate` does not receive lifecycle tools, so TeamMates cannot
 recursively spawn or close TeamMates.
+
+Pre-#199 *removed* state is a different case from a forward-compatible missing
+field: it fails loud (issue #199 Slice 5, the 0.x no-migration policy of issue
+#98). A removed whole-file/dir layout — the `teammate/identities/` directory,
+the `teammate/sessions.jsonl` session ledger, the per-name `teammate/history/`
+index, or the `team/ledger/` audit dir — is detected by
+`dispatcher-service/legacy-state.ts` and aborts `dreamux serve` startup with the
+exact path(s) to delete (`dreamux doctor` reports the same as a diagnostic);
+detection only, the files are never read for migration or removed. A removed
+*field* still sitting in a present record (`checkpoint` / `checkpoint_kind` /
+`session_ref` / `display_name` / `close_status` on a teammate record, or a
+channel binding keyed by the old `team_id` instead of `team_name`) is rejected
+by that record's reader with the same rebuild guidance.
+
+> **Superseded by issue #199 Slice 3.** The per-dispatcher `sessions.jsonl`
+> session ledger described below was replaced by the per-name storage in the
+> layout above: `teammate/records/<name>.json` (identity + a rolling recovery
+> summary; the source for history/list/status) and `teammate/turns/<name>.jsonl`
+> (the only JSONL store; compact per-turn rows folded by `last`). The
+> Dreamux-minted `session_id` ledger key and the persisted `checkpoint` object
+> are gone — `session_id` is now the runtime-native thread id, persisted
+> directly, and the resume checkpoint kind is rebuilt from the runtime. The team
+> audit ledger (`team/ledger/<id>.jsonl`) was removed too; only `teammate/turns`
+> uses JSONL. The historical narrative below is kept for context.
 
 Issue #182 PR-5 adds a durable **session ledger**: one per-dispatcher
 append-only `state/<dispatcher-id>/teammate/sessions.jsonl` capturing session
@@ -730,17 +792,17 @@ the TeamMate name a concrete, never-reused address:
   explicit `assistant_truncated` flag, alongside the existing compact
   `assistant_preview`. No new per-turn file/index is added; cache-spill paths are
   never persisted as the source of truth.
-- **`last(turns)`.** `last` resolves a concrete name to one identity/session_id
-  and folds `sessions.jsonl` filtered by that session_id, returning the most
-  recent `turns` settled turns (default 1, range 1..5; newest last) with the
-  captured assistant text + truncation metadata. It never starts, resumes, or
-  requires a live runtime, so it serves a closed/stopped teammate from the ledger
-  alone — it is the fallback when reverse-delivery of a completion failed.
-- **Read-surface cleanup.** `list` stays compact (concrete name, display name,
-  status, repo/cwd/session essentials), `status` exposes the current state by
-  concrete name, and `history` is the durable session-ledger search surface. The
-  obsolete `ctx` and raw `history_events` verbs are removed everywhere (MCP
-  schema, admin methods, capabilities `verbs`, docs).
+- **`last(turns)`** (as built in #188; the source moved to `teammate/turns` in
+  #199 Slice 3). `last` returned the most recent `turns` settled turns (default
+  1, range 1..5; newest last) with the captured assistant text + truncation
+  metadata. It never starts, resumes, or requires a live runtime, so it serves a
+  closed/stopped teammate — it is the fallback when reverse-delivery of a
+  completion failed.
+- **Read-surface cleanup** (#188). `list`/`status`/`history` were established as
+  the no-poll read surfaces; #199 reshaped their backing storage (records +
+  turns) and trimmed the public rows. The obsolete `ctx` and raw `history_events`
+  verbs are removed everywhere (MCP schema, admin methods, capabilities `verbs`,
+  docs).
 
 ## Team Mode Core
 
@@ -780,13 +842,25 @@ A TeamLeader is a TeamMate identity with `role:
 identities with `role: "team_member"` and `owner.kind: "team"`.
 
 The same `teammate` MCP surface is caller-scoped by server-derived principal,
-not by tool arguments. Dispatcher callers see dispatcher-owned TeamMates and
-TeamLeaders. TeamLeader callers see only members owned by their own team and
-spawn members into the shared Team managed worktree. Ordinary TeamMate callers
-still do not receive lifecycle tools.
+not by tool arguments, through a SINGLE visibility predicate (`principalCanAccess`)
+enforced at exactly two chokepoints — a scoped list read and a scoped single read
+— so no read site can widen visibility independently (issue #199 Slice 4). The
+rules: a dispatcher caller sees ONLY the ordinary TeamMates it directly spawned
+(`role: "teammate"`) — NOT the TeamLeaders (which are dispatcher-owned but
+`role: "team_leader"`) and NOT Team members; a TeamLeader caller sees only the
+members of its own Team; an ordinary TeamMate caller sees no peers (and gets no
+lifecycle tools). A dispatcher inspects its Teams — including the compact leader
+and member-count summary — through the `team.*` surface, never through
+`teammate.*`. The Team service controls its own TeamLeader and members through an
+INTERNAL `team_service` authority (constructed only by the Team service, never
+derived from a public caller), since a TeamLeader is reachable by no public
+principal. TeamLeader members spawn into the shared Team workspace (a managed git
+worktree, or — when the Team was created with no `repo` — the plain
+`.workspace/work/<team_name>/` dir), never a separate per-member directory.
 
-Channel binding is persisted under `state/<dispatcher-id>/team/` and is scoped
-to group chats only. Bound Feishu group inbound is gated and formatted by the
+Channel binding is persisted as JSON under
+`state/<dispatcher-id>/team/channel-bindings.json`, keyed by the concrete
+`team_name` (issue #199 Slice 4), and is scoped to group chats only. Bound Feishu group inbound is gated and formatted by the
 Feishu channel exactly as before, then routed by Dispatcher Service to the
 owning TeamLeader runtime. Unbound and P2P inbound still route to the
 dispatcher. `transfer_channel_back` deactivates a binding; `dissolve` transfers

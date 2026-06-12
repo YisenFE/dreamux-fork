@@ -100,31 +100,38 @@ see its `verbs/` (spawn/resume/history), `persistence/history-index.ts` and
   teammate layer only knows teammate identities.
 - **Dispatcher-facing verbs, no unified suffix:** `spawn`, `send`, `close` for
   lifecycle; `history`, `list`, `status`, `last`, `get_capabilities` for
-  read/recovery. `history` is the durable session-ledger recovery search
-  surface; `last` reads a teammate's most recent settled turn(s) from that
-  ledger by concrete name (issue #188 reworked both and removed the obsolete
-  `ctx` and raw `history_events` verbs). `spawn`/`send` return after submitting
+  read/recovery. `history` is the recovery search surface, served from the
+  per-name records; `last` reads a teammate's most recent settled turn(s) by
+  concrete name from the per-name turns archive (issue #188 reworked both and
+  removed the obsolete `ctx` and raw `history_events` verbs; issue #199 Slice 3
+  moved both off the session ledger — see top-level-design). `spawn`/`send` return after submitting
   the runtime turn; the dispatcher recovers through history/last instead of a
   task result ledger. (Issue #155 dropped the original standalone `resume`
   verb — see below.)
 - **send subsumes resume (issue #155).** The original design carried a separate
   `resume` verb to bring back a prior teammate session with its history; that is
   gone. `send` now reopens a teammate that is not live — including a `close`d one
-  — from its persisted checkpoint, then submits, so `close` is a reversible
+  — by rebuilding the resume checkpoint from the record's runtime-native
+  `session_id` plus the runtime's own declared checkpoint kind (issue #199 Slice
+  3; the kind is never persisted), then submits, so `close` is a reversible
   soft-stop. Read-only verbs never reopen a closed teammate.
-- **History stitches the resume chain.** A forward-only JSONL index records
-  `spawn`, `send`, `close`, and runtime state events (`resume` events remain a
-  readable legacy type from pre-#155 history). History writes must never fail a
-  lifecycle verb. Per-runtime checkpoint mechanics are absorbed by the runtime
-  implementation behind one `resume()` runtime surface.
+- **History reads the record, not an event stream (issue #199 Slice 3).**
+  `history` / `list` / `status` project the per-name `records/<name>.json`
+  recovery record — identity plus a rolling summary (turn count, last-seen,
+  last prompt/assistant previews) maintained on each turn. The only JSONL store
+  is the per-name `turns/<name>.jsonl` archive (compact submit/settled rows)
+  that `last` folds; there is no separate forward-only history event index, and
+  neither store write may fail a lifecycle verb. Per-runtime checkpoint
+  mechanics are absorbed by the runtime implementation behind one `resume()`
+  runtime surface.
 - **Identity and state location.** A teammate is a flat name plus a base record
   (agent runtime id, dispatcher owner, source/runtime cwd, optional managed
-  worktree metadata, checkpoint, status, close metadata). State is server-owned
-  under `~/.dreamux/state/<dispatcher>/teammate/` with `identities/`, `runtime/`,
-  and managed `worktrees/` subtrees plus the per-dispatcher `sessions.jsonl`
-  recovery ledger; paths go through `/packages/dreamux/src/platform/paths.ts`.
-  (The per-name `history/<name>.jsonl` index was removed in issue #182 PR-8 — the
-  session ledger is the single durable recovery record; see top-level-design.)
+  worktree metadata, runtime-native `session_id`, status, close metadata). State
+  is server-owned under `~/.dreamux/state/<dispatcher>/teammate/`; paths go
+  through `/packages/dreamux/src/platform/paths.ts`. (Issue #199 Slice 3 settled
+  the layout on the per-name `records/<name>.json` recovery record plus the
+  per-name `turns/<name>.jsonl` archive, retiring the `sessions.jsonl` session
+  ledger and the persisted `checkpoint` object — see top-level-design.)
 - **Ownership.** The Dispatcher Service owns TeamMate identity and history
   through focused modules under
   `/packages/dreamux/src/dispatcher-service/teammate/`.

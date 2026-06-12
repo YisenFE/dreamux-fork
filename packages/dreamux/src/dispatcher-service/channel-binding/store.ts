@@ -1,7 +1,9 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
 
+import { writeFileAtomic } from '../../platform/atomic-write.js';
+import { isNotFound } from '../../platform/fs-errors.js';
 import { dispatcherChannelBindingsPath } from '../../platform/paths.js';
+import { LegacyStateError } from '../legacy-state.js';
 
 export type ChannelProvider = 'builtin:feishu';
 export type ChannelChatType = 'group' | 'p2p';
@@ -10,7 +12,8 @@ export interface ChannelBinding {
   provider: ChannelProvider;
   chat_id: string;
   chat_type: 'group';
-  team_id: string;
+  /** The concrete Team key the chat is bound to (issue #199 Slice 4). */
+  team_name: string;
   leader_name: string;
   active: boolean;
   created_at: number;
@@ -28,7 +31,7 @@ export interface BindChannelInput {
   provider: ChannelProvider;
   chatId: string;
   chatType: ChannelChatType;
-  teamId: string;
+  teamName: string;
   leaderName: string;
 }
 
@@ -50,7 +53,7 @@ export class ChannelBindingStore {
       provider: input.provider,
       chat_id: input.chatId,
       chat_type: input.chatType,
-      team_id: input.teamId,
+      team_name: input.teamName,
       leader_name: input.leaderName,
       active: true,
       created_at: now,
@@ -115,6 +118,23 @@ export class ChannelBindingStore {
     if (value['version'] !== 1 || !Array.isArray(value['bindings'])) {
       throw new Error(`invalid channel binding store for dispatcher ${dispatcherId}`);
     }
+    // #199 Slice 5 fail-loud: a pre-Slice-4 binding keyed the chat on the old
+    // `team_id` instead of the concrete `team_name`. Dreamux 0.x does not
+    // migrate it — reject with rebuild guidance rather than reading a row that
+    // can no longer resolve a Team.
+    const legacy = (value['bindings'] as Record<string, unknown>[]).some((row) =>
+      typeof row === 'object' &&
+      row !== null &&
+      !Object.prototype.hasOwnProperty.call(row, 'team_name') &&
+      Object.prototype.hasOwnProperty.call(row, 'team_id'),
+    );
+    if (legacy) {
+      throw new LegacyStateError(
+        `channel binding store for dispatcher ${dispatcherId} has pre-#199 rows keyed by ` +
+          'team_id instead of team_name. Dreamux 0.x does not migrate old state — delete ' +
+          `${dispatcherChannelBindingsPath(dispatcherId)} and re-bind the channel(s) to rebuild it.`,
+      );
+    }
     return value as unknown as ChannelBindingFile;
   }
 
@@ -123,16 +143,6 @@ export class ChannelBindingStore {
     file: ChannelBindingFile,
   ): Promise<void> {
     const path = dispatcherChannelBindingsPath(dispatcherId);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+    await writeFileAtomic(path, `${JSON.stringify(file, null, 2)}\n`);
   }
-}
-
-function isNotFound(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    'code' in err &&
-    (err as { code?: unknown }).code === 'ENOENT'
-  );
 }

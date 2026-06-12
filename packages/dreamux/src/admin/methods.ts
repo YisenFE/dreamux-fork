@@ -136,21 +136,30 @@ export const adminMethods: Record<string, AdminHandler> = {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
     const caller = callerPrincipal(id, params);
-    const name = mustString(params, 'name');
+    const name = mustString(params, 'name_prefix');
     const prompt = mustString(params, 'prompt');
+    // Required recovery subject (issue #182 PR-3) — validated before any
+    // work-directory resolution so a malformed request fails fast.
+    const intent = mustNonEmptyString(params, 'intent');
     const agentRuntime = optionalString(params, 'agent_runtime');
-    const cwd = caller.kind === 'team_leader' ? optionalString(params, 'cwd') : mustString(params, 'cwd');
     if (caller.kind === 'team_leader' && params?.['owner'] !== undefined) {
       throw new AdminError('BAD_REQUEST', 'TeamMate owner and team_id are server-derived for team_leader callers');
     }
-    const worktree =
-      caller.kind === 'team_leader' ? null : optionalWorktreeRequest(params, 'worktree');
+    // #199: dispatcher callers pass an optional `repo` object; a team_leader
+    // member always inherits the shared team workspace and takes no repo input.
+    // Omitted `repo` → leave cwd unset so the service creates the default
+    // per-name work dir (`.workspace/work/<name>/`). An explicit `repo` resolves
+    // to its `path`, or the dispatcher workspace when the repo gives no path.
+    const repo = caller.kind === 'team_leader' ? null : repoRequest(params, 'repo');
+    const cwd =
+      caller.kind === 'team_leader' || repo === null
+        ? null
+        : repo.cwd ?? (await server.dispatcherService.teammates.dispatcherWorkspace(id));
+    const worktree = caller.kind === 'team_leader' ? null : repo?.worktree ?? null;
     const sharedWorkspace =
       caller.kind === 'team_leader'
         ? await server.dispatcherService.teams.sharedWorkspace(id, caller.teamId)
         : undefined;
-    // Required recovery subject (issue #182 PR-3).
-    const intent = mustNonEmptyString(params, 'intent');
     try {
       return await server.dispatcherService.teammates.spawnScoped({
         principal: caller,
@@ -256,19 +265,29 @@ export const adminMethods: Record<string, AdminHandler> = {
   'mcp.team.create': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    const name = mustString(params, 'name');
-    const repoCwd = mustString(params, 'repo_cwd');
+    const name = mustString(params, 'team_name');
     const leaderAgentRuntime = mustString(params, 'leader_agent_runtime');
-    const worktree = optionalWorktreeRequest(params, 'worktree');
-    // Required recovery subject (issue #182 PR-3).
+    // Required recovery subject (issue #182 PR-3) — validated before any
+    // work-directory resolution so a malformed request fails fast.
     const intent = mustNonEmptyString(params, 'intent');
+    // #199: optional `repo` object replaces the required `repo_cwd`. Omitted →
+    // leave repoCwd unset so the Team runs in the default
+    // `.workspace/work/<team_name>/` dir (no git worktree). An explicit `repo`
+    // resolves to its `path`, or the dispatcher workspace when the repo gives no
+    // path; `repo: { mode: 'managed' }` creates a git worktree.
+    const repo = repoRequest(params, 'repo');
+    const repoCwd =
+      repo === null
+        ? null
+        : repo.cwd ?? (await server.dispatcherService.teammates.dispatcherWorkspace(id));
+    const worktree = repo?.worktree ?? null;
     const prompt = optionalString(params, 'prompt');
     const bindGroup = optionalBindGroup(params, 'bind_group');
     try {
       return await server.dispatcherService.createTeam({
         dispatcherId: id,
         name,
-        repoCwd,
+        ...(repoCwd !== null ? { repoCwd } : {}),
         leaderAgentRuntime,
         intent,
         ...(worktree !== null ? { worktree } : {}),
@@ -289,17 +308,16 @@ export const adminMethods: Record<string, AdminHandler> = {
   'mcp.team.status': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    // #182 PR-7: public addressing is by `name` (== team_id storage key).
-    const name = mustString(params, 'name');
+    // #182 PR-7: public addressing is by `team_name` (== team_id storage key).
+    const name = mustString(params, 'team_name');
     return server.dispatcherService.getTeamStatus(id, name);
   },
 
   'mcp.team.history': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    const name = optionalString(params, 'name');
+    const name = optionalString(params, 'team_name');
     const status = optionalTeamStatus(params, 'status');
-    const closeStatus = optionalCloseStatus(params, 'close_status');
     const repo = optionalString(params, 'repo');
     const grep = optionalString(params, 'grep');
     const since = optionalInteger(params, 'since');
@@ -310,7 +328,6 @@ export const adminMethods: Record<string, AdminHandler> = {
       dispatcherId: id,
       ...(name !== null ? { name } : {}),
       ...(status !== null ? { status } : {}),
-      ...(closeStatus !== null ? { closeStatus } : {}),
       ...(repo !== null ? { repo } : {}),
       ...(grep !== null ? { grep } : {}),
       ...(since !== null ? { since } : {}),
@@ -327,7 +344,7 @@ export const adminMethods: Record<string, AdminHandler> = {
     // longer takes `chat_type` (the store rejects non-group for Team binding).
     return server.dispatcherService.bindTeamChannel({
       dispatcherId: id,
-      teamId: mustString(params, 'name'),
+      teamId: mustString(params, 'team_name'),
       provider: 'builtin:feishu',
       chatId: mustString(params, 'chat_id'),
       chatType: 'group',
@@ -351,7 +368,7 @@ export const adminMethods: Record<string, AdminHandler> = {
   'mcp.team.dissolve': async (server, params) => {
     const id = mustDispatcherId(params);
     mustExistingDispatcher(server, id);
-    const name = mustString(params, 'name');
+    const name = mustString(params, 'team_name');
     // Required dissolve reason (issue #182 PR-3).
     const note = mustNonEmptyString(params, 'note');
     return server.dispatcherService.dissolveTeam({
@@ -475,10 +492,18 @@ function optionalString(
   return v;
 }
 
-function optionalWorktreeRequest(
+/**
+ * Map the public `repo` input object (issue #199 Slice 2) onto the internal
+ * cwd + worktree request. Returns null when no `repo` was supplied so the caller
+ * applies the surface's own default (dispatcher workspace, and reuse-cwd for a
+ * teammate / managed for a Team). The worktree mode is always explicit when a
+ * `repo` is supplied, so a `reuse-cwd` request is never reinterpreted as the
+ * Team's managed default.
+ */
+function repoRequest(
   params: Record<string, unknown> | undefined,
   key: string,
-): TeamMateWorktreeRequest | null {
+): { cwd: string | null; worktree: TeamMateWorktreeRequest | null } | null {
   if (params === undefined) return null;
   const value = params[key];
   if (value === undefined || value === null) return null;
@@ -493,23 +518,26 @@ function optionalWorktreeRequest(
       `param '${key}.mode' must be 'reuse-cwd' or 'managed'`,
     );
   }
+  const cwd = optionalString(obj, 'path');
+  if (mode === 'reuse-cwd') {
+    return { cwd, worktree: { mode: 'reuse-cwd' } };
+  }
   const cleanup = optionalString(obj, 'cleanup');
-  if (
-    cleanup !== null &&
-    cleanup !== 'keep' &&
-    cleanup !== 'delete-on-close'
-  ) {
+  if (cleanup !== null && cleanup !== 'keep' && cleanup !== 'delete-on-close') {
     throw new AdminError(
       'BAD_REQUEST',
       `param '${key}.cleanup' must be 'keep' or 'delete-on-close'`,
     );
   }
   return {
-    mode,
-    ...optionalStringProp(obj, 'slug'),
-    ...optionalStringProp(obj, 'base_ref'),
-    ...optionalStringProp(obj, 'branch'),
-    ...(cleanup !== null ? { cleanup } : {}),
+    cwd,
+    worktree: {
+      mode,
+      ...optionalStringProp(obj, 'slug'),
+      ...optionalStringProp(obj, 'base_ref'),
+      ...optionalStringProp(obj, 'branch'),
+      ...(cleanup !== null ? { cleanup } : {}),
+    },
   };
 }
 
@@ -517,37 +545,34 @@ function historyQuery(
   params: Record<string, unknown> | undefined,
 ): Omit<TeamMateHistoryQuery, 'dispatcherId'> {
   const name = optionalString(params, 'name');
-  const id = optionalString(params, 'id');
+  const status = optionalTeammateStatus(params, 'status');
   const agentRuntime = optionalString(params, 'agent_runtime');
-  const state = optionalHistoryState(params, 'state');
-  const closeStatus = optionalCloseStatus(params, 'close_status');
-  const sourceCwd = optionalString(params, 'source_cwd');
-  const runtimeCwd = optionalString(params, 'runtime_cwd');
+  const repo = optionalString(params, 'repo');
   const grep = optionalString(params, 'grep');
+  const since = optionalInteger(params, 'since');
+  const until = optionalInteger(params, 'until');
   const cursor = optionalString(params, 'cursor');
   const limit = optionalInteger(params, 'limit');
   return {
     ...(name !== null ? { name } : {}),
-    ...(id !== null ? { id } : {}),
+    ...(status !== null ? { status } : {}),
     ...(agentRuntime !== null ? { agentRuntime } : {}),
-    ...(state !== null ? { state } : {}),
-    ...(closeStatus !== null ? { closeStatus } : {}),
-    ...(sourceCwd !== null ? { sourceCwd } : {}),
-    ...(runtimeCwd !== null ? { runtimeCwd } : {}),
+    ...(repo !== null ? { repo } : {}),
     ...(grep !== null ? { grep } : {}),
+    ...(since !== null ? { since } : {}),
+    ...(until !== null ? { until } : {}),
     ...(cursor !== null ? { cursor } : {}),
     ...(limit !== null ? { limit } : {}),
   };
 }
 
-function optionalHistoryState(
+function optionalTeammateStatus(
   params: Record<string, unknown> | undefined,
   key: string,
-): TeamMateIdentityStatus | 'active' | null {
+): TeamMateIdentityStatus | null {
   const value = optionalString(params, key);
   if (value === null) return null;
   if (
-    value === 'active' ||
     value === 'starting' ||
     value === 'running' ||
     value === 'degraded' ||
@@ -558,18 +583,21 @@ function optionalHistoryState(
   }
   throw new AdminError(
     'BAD_REQUEST',
-    `param '${key}' must be active, starting, running, degraded, closed, or stopped`,
+    `param '${key}' must be starting, running, degraded, closed, or stopped`,
   );
 }
 
-function optionalCloseStatus(
+function optionalTeamStatus(
   params: Record<string, unknown> | undefined,
   key: string,
-): 'open' | 'closed' | null {
+): 'starting' | 'running' | 'closed' | null {
   const value = optionalString(params, key);
   if (value === null) return null;
-  if (value === 'open' || value === 'closed') return value;
-  throw new AdminError('BAD_REQUEST', `param '${key}' must be open or closed`);
+  if (value === 'starting' || value === 'running' || value === 'closed') return value;
+  throw new AdminError(
+    'BAD_REQUEST',
+    `param '${key}' must be starting, running, or closed`,
+  );
 }
 
 function optionalBindGroup(
@@ -587,19 +615,6 @@ function optionalBindGroup(
     throw new AdminError('BAD_REQUEST', `param '${key}.chat_id' must be a non-empty string`);
   }
   return { chatId };
-}
-
-function optionalTeamStatus(
-  params: Record<string, unknown> | undefined,
-  key: string,
-): 'starting' | 'running' | 'closed' | null {
-  const value = optionalString(params, key);
-  if (value === null) return null;
-  if (value === 'starting' || value === 'running' || value === 'closed') return value;
-  throw new AdminError(
-    'BAD_REQUEST',
-    `param '${key}' must be starting, running, or closed`,
-  );
 }
 
 function optionalInteger(

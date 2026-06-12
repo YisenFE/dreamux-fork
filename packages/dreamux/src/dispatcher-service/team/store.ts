@@ -1,12 +1,12 @@
-import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile, readdir } from 'node:fs/promises';
 
+import { writeFileAtomic } from '../../platform/atomic-write.js';
+import { isNotFound } from '../../platform/fs-errors.js';
 import {
-  dispatcherTeamLedgerPath,
   dispatcherTeamRecordPath,
   dispatcherTeamRecordsDir,
 } from '../../platform/paths.js';
-import type { TeamLedgerEvent, TeamRecord, TeamStatus } from './types.js';
+import type { TeamRecord, TeamStatus } from './types.js';
 import { validateTeamId } from './types.js';
 
 export class TeamStore {
@@ -82,44 +82,9 @@ export class TeamStore {
     return updated;
   }
 
-  async appendLedger(
-    team: TeamRecord,
-    input: Pick<TeamLedgerEvent, 'type' | 'summary'>,
-  ): Promise<void> {
-    const event: TeamLedgerEvent = {
-      version: 1,
-      event_id: Date.now(),
-      timestamp: Date.now(),
-      dispatcher_id: team.dispatcher_id,
-      team_id: team.team_id,
-      type: input.type,
-      summary: input.summary,
-    };
-    const path = dispatcherTeamLedgerPath(team.dispatcher_id, team.team_id);
-    await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, `${JSON.stringify(event)}\n`, { mode: 0o600 });
-  }
-
-  async ledger(dispatcherId: string, teamId: string): Promise<TeamLedgerEvent[]> {
-    validateTeamId(teamId);
-    let raw: string;
-    try {
-      raw = await readFile(dispatcherTeamLedgerPath(dispatcherId, teamId), 'utf8');
-    } catch (err) {
-      if (isNotFound(err)) return [];
-      throw err;
-    }
-    return raw
-      .split('\n')
-      .filter((line) => line.trim() !== '')
-      .map((line) => readLedgerEvent(dispatcherId, teamId, JSON.parse(line) as unknown))
-      .sort((a, b) => a.timestamp - b.timestamp || a.event_id - b.event_id);
-  }
-
   private async write(team: TeamRecord): Promise<void> {
     const path = dispatcherTeamRecordPath(team.dispatcher_id, team.team_id);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, `${JSON.stringify(team, null, 2)}\n`, { mode: 0o600 });
+    await writeFileAtomic(path, `${JSON.stringify(team, null, 2)}\n`);
   }
 }
 
@@ -135,35 +100,4 @@ function readTeam(dispatcherId: string, teamId: string, raw: string): TeamRecord
     throw new Error(`invalid Team record ${JSON.stringify(teamId)}`);
   }
   return value as unknown as TeamRecord;
-}
-
-function readLedgerEvent(
-  dispatcherId: string,
-  teamId: string,
-  value: unknown,
-): TeamLedgerEvent {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new Error('invalid Team ledger event');
-  }
-  const record = value as Record<string, unknown>;
-  if (
-    record['version'] !== 1 ||
-    record['dispatcher_id'] !== dispatcherId ||
-    record['team_id'] !== teamId ||
-    typeof record['timestamp'] !== 'number' ||
-    typeof record['event_id'] !== 'number' ||
-    typeof record['summary'] !== 'string'
-  ) {
-    throw new Error(`invalid Team ledger event for ${JSON.stringify(teamId)}`);
-  }
-  return record as unknown as TeamLedgerEvent;
-}
-
-function isNotFound(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    'code' in err &&
-    (err as { code?: unknown }).code === 'ENOENT'
-  );
 }
